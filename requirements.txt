@@ -7,8 +7,4 @@ psycopg2-binary
 alembic
 python-dotenv
 email-validator
-<<<<<<< Updated upstream
 python-multipart
-=======
-
->>>>>>> Stashed changes
