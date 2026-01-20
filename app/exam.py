@@ -1,50 +1,41 @@
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func
-from sqlalchemy.orm import Session
 import random
+from bson import ObjectId
 from .auth import get_current_user
-from .database import get_db
+from .database import get_database
 from .db_models import AppSetting, ExamResult, Question, StudentProfile, User
-from .audit import log_event
+from .audit import log_event_async
 
 
 router = APIRouter(prefix="/exam", tags=["Exam"])
 @router.post("/start")
-def start_exam(
+async def start_exam(
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     email = current_user["email"]
 
-    profile = (
-        db.query(StudentProfile)
-        .join(User, StudentProfile.user_id == User.id)
-        .filter(User.email == email)
-        .first()
-    )
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    profile = await db.student_profiles.find_one({"user_id": str(user["_id"])})
     if not profile:
         raise HTTPException(status_code=400, detail="Profile not found")
 
-    exam_type = profile.exam_type
+    exam_type = profile["target_licensure"]
+    subjects = profile.get("assigned_review_subjects") or []
 
-    filtered = db.query(Question).filter(Question.exam_type == exam_type)
+    query = {"exam_type": exam_type}
+    if subjects:
+        query["subject"] = {"$in": subjects}
 
-    if exam_type == "LET":
-        if profile.let_track == "Elementary":
-            filtered = filtered.filter(Question.subject == "GenEd")
-        else:
-            major = profile.let_major
-            filtered = filtered.filter(Question.subject == major)
+    question_list = await db.questions.find(query).to_list(length=None)
 
-    if exam_type == "CPA":
-        allowed = ["FAR", "AFAR", "Auditing", "MAS", "RFBT", "Taxation"]
-        filtered = filtered.filter(Question.subject.in_(allowed))
-
-    question_list = filtered.all()
-
-    settings = db.query(AppSetting).first()
-    total_questions = settings.exam_question_count if settings else 50
+    settings = await db.app_settings.find_one({})
+    total_questions = settings["exam_question_count"] if settings else 50
 
     if len(question_list) < total_questions:
         raise HTTPException(
@@ -59,13 +50,13 @@ def start_exam(
 
     return [
         {
-            "id": q.id,
-            "question": q.question,
-            "a": q.a,
-            "b": q.b,
-            "c": q.c,
-            "d": q.d,
-            "difficulty": q.difficulty,
+            "id": str(q["_id"]),
+            "question": q["question"],
+            "a": q["a"],
+            "b": q["b"],
+            "c": q["c"],
+            "d": q["d"],
+            "difficulty": q["difficulty"],
         }
         for q in exam_questions
     ]
@@ -76,19 +67,18 @@ class ExamSubmission(BaseModel):
 
 
 @router.post("/submit")
-def submit_exam(
+async def submit_exam(
     payload: ExamSubmission,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     email = current_user["email"]
 
-    profile = (
-        db.query(StudentProfile)
-        .join(User, StudentProfile.user_id == User.id)
-        .filter(User.email == email)
-        .first()
-    )
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    profile = await db.student_profiles.find_one({"user_id": str(user["_id"])})
     if not profile:
         raise HTTPException(status_code=400, detail="Profile not found")
 
@@ -97,69 +87,64 @@ def submit_exam(
     subject_stats = {}
     incorrect_questions = []
 
-    def get_subject_bucket(question):
-        subject = question.subject
-        if profile.exam_type == "LET" and subject == "GenEd":
-            topic = (question.topic or "").strip().lower()
-            if topic.startswith("professional education"):
-                return "Professional Ed"
-        return subject
-
-    question_ids = [int(qid) for qid in payload.answers.keys()]
-    questions = db.query(Question).filter(Question.id.in_(question_ids)).all()
-    question_map = {str(q.id): q for q in questions}
-
-    for qid, selected in payload.answers.items():
-        question = question_map.get(str(qid))
+    for question_id, selected in payload.answers.items():
+        question = await db.questions.find_one({"_id": ObjectId(question_id)})
         if not question:
             continue
-        bucket = get_subject_bucket(question)
+
+        subject = question["subject"]
+        bucket = subject
+        if profile["target_licensure"] == "LET" and subject == "GenEd":
+            topic = (question.get("topic") or "").strip().lower()
+            if topic.startswith("professional education"):
+                bucket = "Professional Ed"
+
         subject_stats.setdefault(bucket, {"correct": 0, "total": 0})
         subject_stats[bucket]["total"] += 1
 
-        if selected == question.answer:
+        if selected == question["answer"]:
             score += 1
             subject_stats[bucket]["correct"] += 1
         else:
             reference = (
-                f"Review: {question.topic}"
-                if question.topic
+                f"Review: {question.get('topic')}"
+                if question.get("topic")
                 else "Review this topic"
             )
             incorrect_questions.append(
                 {
-                    "id": question.id,
-                    "subject": question.subject,
-                    "topic": question.topic,
-                    "difficulty": question.difficulty,
-                    "question": question.question,
-                    "correct_answer": question.answer,
+                    "id": str(question["_id"]),
+                    "subject": question["subject"],
+                    "topic": question.get("topic"),
+                    "difficulty": question["difficulty"],
+                    "question": question["question"],
+                    "correct_answer": question["answer"],
                     "student_answer": selected,
                     "reference": reference,
                 }
             )
 
     percentage = round((score / total) * 100, 2) if total else 0
-    result = "PASS" if percentage >= 60 else "FAIL"
+    passing_threshold = profile.get("required_passing_threshold", 60)
+    result = "PASS" if percentage >= passing_threshold else "FAIL"
 
-    exam_result = ExamResult(
-        user_id=profile.user_id,
-        exam_type=profile.exam_type,
-        score=score,
-        total=total,
-        percentage=percentage,
-        result=result,
-        subject_performance=subject_stats,
-        incorrect_questions=incorrect_questions,
-    )
-    db.add(exam_result)
-    db.commit()
-    db.refresh(exam_result)
-    log_event(db, profile.user_id, "exam_submit", f"Score {score}/{total} ({percentage}%)")
+    exam_result_data = {
+        "user_id": str(user["_id"]),
+        "exam_type": profile["target_licensure"],
+        "score": score,
+        "total": total,
+        "percentage": percentage,
+        "result": result,
+        "subject_performance": subject_stats,
+        "incorrect_questions": incorrect_questions,
+        "created_at": datetime.utcnow()
+    }
+    result_insert = await db.exam_results.insert_one(exam_result_data)
+    await log_event_async(db, str(user["_id"]), "exam_submit", f"Score {score}/{total} ({percentage}%)")
 
     return {
         "email": email,
-        "exam_type": profile.exam_type,
+        "exam_type": profile["target_licensure"],
         "score": score,
         "total": total,
         "percentage": percentage,
@@ -170,33 +155,31 @@ def submit_exam(
 
 
 @router.get("/stats")
-def get_exam_stats(
+async def get_exam_stats(
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] not in {"instructor", "admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    attempts = db.query(ExamResult).count()
-    avg_score = db.query(func.avg(ExamResult.percentage)).scalar() or 0
-    total_answered = db.query(func.sum(ExamResult.total)).scalar() or 0
-    settings = db.query(AppSetting).first()
-    total_questions = settings.exam_question_count if settings else 50
+    attempts = await db.exam_results.count_documents({})
+    pipeline = [
+        {"$group": {"_id": None, "avg_score": {"$avg": "$percentage"}, "total_answered": {"$sum": "$total"}}}
+    ]
+    agg_result = await db.exam_results.aggregate(pipeline).to_list(length=1)
+    avg_score = agg_result[0]["avg_score"] if agg_result else 0
+    total_answered = agg_result[0]["total_answered"] if agg_result else 0
+
+    settings = await db.app_settings.find_one({})
+    total_questions = settings["exam_question_count"] if settings else 50
     completion_rate = (
         round((total_answered / (attempts * total_questions)) * 100, 0)
         if attempts
         else 0
     )
-    active_students = (
-        db.query(User).filter(User.role == "student").count()
-    )
-    recent_results = (
-        db.query(ExamResult)
-        .order_by(ExamResult.created_at.desc())
-        .limit(7)
-        .all()
-    )
-    recent_scores = [result.percentage for result in reversed(recent_results)]
+    active_students = await db.users.count_documents({"role": "student"})
+    recent_results = await db.exam_results.find().sort("created_at", -1).limit(7).to_list(length=7)
+    recent_scores = [result["percentage"] for result in reversed(recent_results)]
 
     return {
         "avg_score": round(avg_score, 2),

@@ -1,5 +1,5 @@
-from pydantic import BaseModel, EmailStr
-from typing import Optional, Literal
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional, Literal, List
 
 
 class RegisterRequest(BaseModel):
@@ -17,13 +17,21 @@ class AdminRegisterRequest(BaseModel):
     admin_key: str
 
 class StudentProfile(BaseModel):
-    student_id: str
-    name: str
-    course: str
-
-    exam_type: Literal["LET", "CPA"]
+    student_id_number: str
+    first_name: str
+    middle_name: Optional[str] = None
+    last_name: str
+    email_address: EmailStr
+    username: str
+    program_degree: str
+    year_level: Optional[int] = Field(default=None, ge=1, le=6)
+    section_class: Optional[str] = None
+    status: Literal["Active", "Inactive", "Graduated"]
+    target_licensure: Literal["LET", "CPA", "Internal Certification"]
     let_track: Optional[Literal["Elementary", "Secondary"]] = None
-    let_major: Optional[str] = None
+    major_specialization: str
+    assigned_review_subjects: List[str]
+    required_passing_threshold: int = Field(ge=1, le=100)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -35,7 +43,7 @@ class ChangePasswordRequest(BaseModel):
 
     
 class Question(BaseModel):
-    id: int
+    id: str
     exam_type: str            # LET or CPA
     subject: str              # GenEd, Math, FAR, AFAR, etc.
     topic: str
@@ -46,5 +54,3 @@ class Question(BaseModel):
     c: str
     d: str
     answer: str               # A, B, C, or D
-
-

@@ -6,11 +6,9 @@ from .exam import router as exam_router
 from .questions import router as questions_router, seed_questions
 from .admin import router as admin_router
 from .access import router as access_router
-from .database import SessionLocal, engine
+from .database import get_database
 from .admin import get_or_create_settings
 from .auth import ensure_admin_user
-from alembic import command
-from alembic.config import Config
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -36,17 +34,11 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def on_startup():
-  if os.getenv("AUTO_MIGRATE", "0") == "1":
-    alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
-    command.upgrade(alembic_cfg, "head")
-  db = SessionLocal()
-  try:
-    seed_questions(db)
-    get_or_create_settings(db)
-    ensure_admin_user(db)
-  finally:
-    db.close()
+async def on_startup():
+    db = get_database()
+    await seed_questions(db)
+    await get_or_create_settings(db)
+    await ensure_admin_user(db)
 
 
 app.include_router(auth_router)

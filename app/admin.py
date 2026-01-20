@@ -1,13 +1,13 @@
 from datetime import datetime, timedelta
+from typing import Optional, Literal
 import secrets
 import string
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field, EmailStr
 from .auth import get_current_user, hash_password
-from .database import get_db
+from .database import get_database
 from .db_models import AppSetting, AuditLog, ExamResult, Question, User
-from .audit import log_event
+from .audit import log_event_async
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -21,54 +21,60 @@ class SettingsUpdate(BaseModel):
     exam_question_count: int = Field(ge=10, le=200)
 
 
+class CreateUserRequest(BaseModel):
+    email: EmailStr
+    role: Literal["student", "instructor", "admin"]
+    password: Optional[str] = None
+    require_password_change: bool = True
+
+
 def _generate_temp_password(length: int = 12) -> str:
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def get_or_create_settings(db: Session) -> AppSetting:
-    settings = db.query(AppSetting).first()
+async def get_or_create_settings(db):
+    settings = await db.app_settings.find_one({})
     if settings:
         return settings
-    settings = AppSetting(exam_time_limit_minutes=90, exam_question_count=50)
-    db.add(settings)
-    db.commit()
-    db.refresh(settings)
-    return settings
+    settings_data = {"exam_time_limit_minutes": 90, "exam_question_count": 50}
+    result = await db.app_settings.insert_one(settings_data)
+    settings_data["_id"] = result.inserted_id
+    return settings_data
 
 
 @router.get("/settings")
-def get_settings(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_settings(current_user=Depends(get_current_user), db = Depends(get_database)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    settings = get_or_create_settings(db)
+    settings = await get_or_create_settings(db)
     return {
-        "exam_time_limit_minutes": settings.exam_time_limit_minutes,
-        "exam_question_count": settings.exam_question_count,
+        "exam_time_limit_minutes": settings["exam_time_limit_minutes"],
+        "exam_question_count": settings["exam_question_count"],
     }
 
 
 @router.get("/settings/public")
-def get_settings_public(
+async def get_settings_public(
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
-    settings = get_or_create_settings(db)
+    settings = await get_or_create_settings(db)
     return {
-        "exam_time_limit_minutes": settings.exam_time_limit_minutes,
-        "exam_question_count": settings.exam_question_count,
+        "exam_time_limit_minutes": settings["exam_time_limit_minutes"],
+        "exam_question_count": settings["exam_question_count"],
     }
 
 
 @router.put("/settings")
-def update_settings(
+async def update_settings(
     payload: SettingsUpdate,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    total_questions = db.query(Question).count()
+    total_questions = await db.questions.count_documents({})
     if payload.exam_question_count > total_questions:
         raise HTTPException(
             status_code=400,
@@ -77,11 +83,15 @@ def update_settings(
                 f"Requested {payload.exam_question_count}, but only {total_questions} available."
             ),
         )
-    settings = get_or_create_settings(db)
-    settings.exam_time_limit_minutes = payload.exam_time_limit_minutes
-    settings.exam_question_count = payload.exam_question_count
-    db.commit()
-    log_event(
+    settings = await get_or_create_settings(db)
+    await db.app_settings.update_one(
+        {"_id": settings["_id"]},
+        {"$set": {
+            "exam_time_limit_minutes": payload.exam_time_limit_minutes,
+            "exam_question_count": payload.exam_question_count
+        }}
+    )
+    await log_event_async(
         db,
         None,
         "settings_update",
@@ -90,249 +100,295 @@ def update_settings(
             f"exam questions set to {payload.exam_question_count}"
         ),
     )
+    updated_settings = await db.app_settings.find_one({"_id": settings["_id"]})
     return {
-        "exam_time_limit_minutes": settings.exam_time_limit_minutes,
-        "exam_question_count": settings.exam_question_count,
+        "exam_time_limit_minutes": updated_settings["exam_time_limit_minutes"],
+        "exam_question_count": updated_settings["exam_question_count"],
     }
 
 
 @router.get("/users")
-def list_users(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def list_users(current_user=Depends(get_current_user), db = Depends(get_database)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    users = db.query(User).order_by(User.created_at.desc()).all()
+    users = await db.users.find().sort("created_at", -1).to_list(length=None)
     return [
         {
-            "id": user.id,
-            "email": user.email,
-            "role": user.role,
-            "active": user.active,
-            "created_at": user.created_at.isoformat(),
+            "id": str(user["_id"]),
+            "email": user["email"],
+            "role": user["role"],
+            "active": user.get("active", True),
+            "created_at": user["created_at"].isoformat(),
         }
         for user in users
     ]
 
 
-@router.put("/users/{user_id}/status")
-def update_user_status(
-    user_id: int,
-    active: bool,
+@router.post("/users")
+async def create_user(
+    payload: CreateUserRequest,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    user = db.query(User).filter(User.id == user_id).first()
+    existing = await db.users.find_one({"email": payload.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    generated_password = None
+    expires_at = None
+    if payload.password:
+        password_to_set = payload.password
+        must_change_password = payload.require_password_change
+        if must_change_password:
+            expires_at = datetime.utcnow() + timedelta(minutes=TEMP_PASSWORD_TTL_MINUTES)
+    else:
+        generated_password = _generate_temp_password()
+        password_to_set = generated_password
+        must_change_password = True
+        expires_at = datetime.utcnow() + timedelta(minutes=TEMP_PASSWORD_TTL_MINUTES)
+
+    user_data = {
+        "email": payload.email,
+        "password_hash": hash_password(password_to_set),
+        "role": payload.role,
+        "active": True,
+        "must_change_password": must_change_password,
+        "temp_password_expires_at": expires_at,
+        "created_at": datetime.utcnow(),
+    }
+    result = await db.users.insert_one(user_data)
+    await log_event_async(db, str(result.inserted_id), "user_create", f"Created {payload.role} {payload.email}")
+    response = {
+        "id": str(result.inserted_id),
+        "email": payload.email,
+        "role": payload.role,
+        "active": True,
+        "created_at": user_data["created_at"].isoformat(),
+    }
+    if generated_password:
+        response["temporary_password"] = generated_password
+        response["expires_at"] = expires_at.isoformat() if expires_at else None
+    return response
+
+
+@router.put("/users/{user_id}/status")
+async def update_user_status(
+    user_id: str,
+    active: bool,
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user.active = active
-    db.commit()
-    log_event(
+    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"active": active}})
+    await log_event_async(
         db,
-        user.id,
+        user_id,
         "user_status",
         f"User {'activated' if active else 'deactivated'}",
     )
-    return {"id": user.id, "active": user.active}
+    return {"id": user_id, "active": active}
 
 
 @router.delete("/users/{user_id}")
-def delete_user(
-    user_id: int,
+async def delete_user(
+    user_id: str,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    user = db.query(User).filter(User.id == user_id).first()
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.active:
+    if user.get("active", True):
         raise HTTPException(status_code=400, detail="Deactivate user before deleting")
-    db.query(ExamResult).filter(ExamResult.user_id == user.id).delete()
-    db.query(AuditLog).filter(AuditLog.user_id == user.id).delete()
-    db.delete(user)
-    db.commit()
-    log_event(db, None, "user_delete", f"Deleted user {user.email}")
+    await db.exam_results.delete_many({"user_id": user_id})
+    await db.audit_logs.delete_many({"user_id": user_id})
+    await db.users.delete_one({"_id": ObjectId(user_id)})
+    await log_event_async(db, None, "user_delete", f"Deleted user {user['email']}")
     return {"deleted": user_id}
 
 
 @router.delete("/users/{user_id}/exams")
-def reset_user_exams(
-    user_id: int,
+async def reset_user_exams(
+    user_id: str,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    user = db.query(User).filter(User.id == user_id).first()
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    deleted = db.query(ExamResult).filter(ExamResult.user_id == user.id).delete()
-    db.commit()
-    log_event(db, user.id, "exam_reset", f"Deleted {deleted} exam results")
-    return {"deleted": deleted}
+    result = await db.exam_results.delete_many({"user_id": user_id})
+    await log_event_async(db, user_id, "exam_reset", f"Deleted {result.deleted_count} exam results")
+    return {"deleted": result.deleted_count}
 
 
 @router.post("/users/{user_id}/password-reset")
-def reset_user_password(
-    user_id: int,
+async def reset_user_password(
+    user_id: str,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    user = db.query(User).filter(User.id == user_id).first()
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     temp_password = _generate_temp_password()
-    user.password_hash = hash_password(temp_password)
-    user.must_change_password = True
-    user.temp_password_expires_at = datetime.utcnow() + timedelta(
-        minutes=TEMP_PASSWORD_TTL_MINUTES
+    expires_at = datetime.utcnow() + timedelta(minutes=TEMP_PASSWORD_TTL_MINUTES)
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {
+            "password_hash": hash_password(temp_password),
+            "must_change_password": True,
+            "temp_password_expires_at": expires_at
+        }}
     )
-    db.commit()
-    log_event(
+    await log_event_async(
         db,
-        user.id,
+        user_id,
         "password_reset_issued",
-        f"Reset by {current_user['email']}; expires {user.temp_password_expires_at.isoformat()}",
+        f"Reset by {current_user['email']}; expires {expires_at.isoformat()}",
     )
     return {
         "temporary_password": temp_password,
-        "expires_at": user.temp_password_expires_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
     }
 
 
-
-
-
-
 @router.get("/audit-logs")
-def list_audit_logs(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def list_audit_logs(current_user=Depends(get_current_user), db = Depends(get_database)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(100).all()
+    logs = await db.audit_logs.find().sort("created_at", -1).limit(100).to_list(length=100)
     return [
         {
-            "id": log.id,
-            "user_id": log.user_id,
-            "action": log.action,
-            "detail": log.detail,
-            "created_at": log.created_at.isoformat(),
+            "id": str(log["_id"]),
+            "user_id": log.get("user_id"),
+            "action": log["action"],
+            "detail": log["detail"],
+            "created_at": log["created_at"].isoformat(),
         }
         for log in logs
     ]
 
 
 @router.get("/access-requests")
-def list_access_requests(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def list_access_requests(current_user=Depends(get_current_user), db = Depends(get_database)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
     cutoff = datetime.utcnow() - timedelta(seconds=REQUEST_TTL_SECONDS)
-    logs = (
-        db.query(AuditLog)
-        .filter(AuditLog.action.in_(ACCESS_ACTIONS), AuditLog.created_at >= cutoff)
-        .order_by(AuditLog.created_at.desc())
-        .all()
-    )
+    logs = await db.audit_logs.find({
+        "action": {"$in": list(ACCESS_ACTIONS)},
+        "created_at": {"$gte": cutoff}
+    }).sort("created_at", -1).to_list(length=None)
     latest_by_user = {}
     for log in logs:
-        if log.user_id not in latest_by_user:
-            latest_by_user[log.user_id] = log
+        uid = log.get("user_id")
+        if uid and uid not in latest_by_user:
+            latest_by_user[uid] = log
     requests = []
     for user_id, log in latest_by_user.items():
-        if log.action != "access_request":
+        if log["action"] != "access_request":
             continue
-        user = db.query(User).filter(User.id == user_id).first()
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
             continue
         requests.append(
             {
-                "id": user.id,
-                "email": user.email,
-                "role": user.role,
-                "requested_at": log.created_at.isoformat(),
+                "id": str(user["_id"]),
+                "email": user["email"],
+                "role": user["role"],
+                "requested_at": log["created_at"].isoformat(),
             }
         )
     return requests
 
 
 @router.get("/access-statuses")
-def list_access_statuses(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def list_access_statuses(current_user=Depends(get_current_user), db = Depends(get_database)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    users = db.query(User).all()
-    logs = (
-        db.query(AuditLog)
-        .filter(AuditLog.action.in_(ACCESS_ACTIONS))
-        .order_by(AuditLog.created_at.desc())
-        .all()
-    )
+    users = await db.users.find().to_list(length=None)
+    logs = await db.audit_logs.find({"action": {"$in": list(ACCESS_ACTIONS)}}).sort("created_at", -1).to_list(length=None)
     latest_by_user = {}
     for log in logs:
-        if log.user_id not in latest_by_user:
-            latest_by_user[log.user_id] = log
+        uid = log.get("user_id")
+        if uid and uid not in latest_by_user:
+            latest_by_user[uid] = log
     cutoff = datetime.utcnow() - timedelta(seconds=REQUEST_TTL_SECONDS)
     statuses = []
     for user in users:
-        if user.role == "admin":
-            statuses.append({"id": user.id, "status": "approved"})
+        uid = str(user["_id"])
+        if user["role"] == "admin":
+            statuses.append({"id": uid, "status": "approved"})
             continue
-        latest = latest_by_user.get(user.id)
+        latest = latest_by_user.get(uid)
         if not latest:
-            statuses.append({"id": user.id, "status": "pending"})
+            statuses.append({"id": uid, "status": "pending"})
             continue
-        if latest.action == "access_approved":
-            statuses.append({"id": user.id, "status": "approved"})
+        if latest["action"] == "access_approved":
+            statuses.append({"id": uid, "status": "approved"})
             continue
-        if latest.action == "access_denied":
-            statuses.append({"id": user.id, "status": "denied"})
+        if latest["action"] == "access_denied":
+            statuses.append({"id": uid, "status": "denied"})
             continue
-        if latest.action == "access_request":
-            if latest.created_at < cutoff:
+        if latest["action"] == "access_request":
+            if latest["created_at"] < cutoff:
                 statuses.append(
-                    {"id": user.id, "status": "expired", "detail": latest.detail}
+                    {"id": uid, "status": "expired", "detail": latest.get("detail")}
                 )
             else:
                 statuses.append(
-                    {"id": user.id, "status": "pending", "detail": latest.detail}
+                    {"id": uid, "status": "pending", "detail": latest.get("detail")}
                 )
             continue
-        statuses.append({"id": user.id, "status": "pending"})
+        statuses.append({"id": uid, "status": "pending"})
     return statuses
 
 
 @router.post("/access-requests/{user_id}/approve")
-def approve_access_request(
-    user_id: int,
+async def approve_access_request(
+    user_id: str,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    user = db.query(User).filter(User.id == user_id).first()
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user.active = True
-    db.commit()
-    log_event(db, user.id, "access_approved", "Access approved")
-    return {"id": user.id, "status": "approved"}
+    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"active": True}})
+    await log_event_async(db, user_id, "access_approved", "Access approved")
+    return {"id": user_id, "status": "approved"}
 
 
 @router.post("/access-requests/{user_id}/deny")
-def deny_access_request(
-    user_id: int,
+async def deny_access_request(
+    user_id: str,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
-    user = db.query(User).filter(User.id == user_id).first()
+    from bson import ObjectId
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user.active = False
-    db.commit()
-    log_event(db, user.id, "access_denied", "Access denied")
-    return {"id": user.id, "status": "denied"}
+    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"active": False}})
+    await log_event_async(db, user_id, "access_denied", "Access denied")
+    return {"id": user_id, "status": "denied"}

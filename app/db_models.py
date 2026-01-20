@@ -1,88 +1,123 @@
 from datetime import datetime
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String
-from sqlalchemy.orm import relationship
-from .database import Base
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field
+from bson import ObjectId
 
 
-class User(Base):
-    __tablename__ = "users"
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
 
-    id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    password_hash = Column(String, nullable=False)
-    role = Column(String, nullable=False)
-    active = Column(Boolean, nullable=False, default=True)
-    must_change_password = Column(Boolean, nullable=False, default=False)
-    temp_password_expires_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid objectid")
+        return ObjectId(v)
 
-    profile = relationship("StudentProfile", back_populates="user", uselist=False)
-    exam_results = relationship("ExamResult", back_populates="user")
-
-
-class StudentProfile(Base):
-    __tablename__ = "student_profiles"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    student_id = Column(String, nullable=False)
-    name = Column(String, nullable=False)
-    course = Column(String, nullable=False)
-    exam_type = Column(String, nullable=False)
-    let_track = Column(String, nullable=True)
-    let_major = Column(String, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    user = relationship("User", back_populates="profile")
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema, handler):
+        return {"type": "string"}
 
 
+class User(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    email: str
+    password_hash: str
+    role: str
+    active: bool = True
+    must_change_password: bool = False
+    temp_password_expires_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
-class Question(Base):
-    __tablename__ = "questions"
-
-    id = Column(Integer, primary_key=True)
-    exam_type = Column(String, nullable=False)
-    subject = Column(String, nullable=False)
-    topic = Column(String, nullable=False)
-    difficulty = Column(String, nullable=False)
-    question = Column(String, nullable=False)
-    a = Column(String, nullable=False)
-    b = Column(String, nullable=False)
-    c = Column(String, nullable=False)
-    d = Column(String, nullable=False)
-    answer = Column(String, nullable=False)
-
-
-class ExamResult(Base):
-    __tablename__ = "exam_results"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    exam_type = Column(String, nullable=False)
-    score = Column(Integer, nullable=False)
-    total = Column(Integer, nullable=False)
-    percentage = Column(Float, nullable=False)
-    result = Column(String, nullable=False)
-    subject_performance = Column(JSON, nullable=False)
-    incorrect_questions = Column(JSON, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    user = relationship("User", back_populates="exam_results")
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
 
 
-class AppSetting(Base):
-    __tablename__ = "app_settings"
+class StudentProfile(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    user_id: str  # ObjectId as string
+    student_id_number: str
+    first_name: str
+    middle_name: Optional[str] = None
+    last_name: str
+    email_address: str
+    username: str
+    program_degree: str
+    year_level: Optional[int] = None
+    section_class: Optional[str] = None
+    status: str
+    target_licensure: str
+    let_track: Optional[str] = None
+    major_specialization: str
+    assigned_review_subjects: List[str]
+    required_passing_threshold: int
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    id = Column(Integer, primary_key=True)
-    exam_time_limit_minutes = Column(Integer, nullable=False, default=90)
-    exam_question_count = Column(Integer, nullable=False, default=50)
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
 
 
-class AuditLog(Base):
-    __tablename__ = "audit_logs"
+class Question(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    exam_type: str
+    subject: str
+    topic: str
+    difficulty: str
+    question: str
+    a: str
+    b: str
+    c: str
+    d: str
+    answer: str
 
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    action = Column(String, nullable=False)
-    detail = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class ExamResult(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    user_id: str  # ObjectId as string
+    exam_type: str
+    score: int
+    total: int
+    percentage: float
+    result: str
+    subject_performance: Dict[str, Any]
+    incorrect_questions: List[Dict[str, Any]]
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class AppSetting(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    exam_time_limit_minutes: int = 90
+    exam_question_count: int = 50
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class AuditLog(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    user_id: Optional[str] = None  # ObjectId as string
+    action: str
+    detail: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}

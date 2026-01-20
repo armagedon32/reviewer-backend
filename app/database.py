@@ -1,23 +1,15 @@
 import os
+from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@localhost:5432/reviewer_ui",
-)
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "reviewer_ui")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
+client = AsyncIOMotorClient(MONGODB_URL)
+database = client[DATABASE_NAME]
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def get_database():
+    return database

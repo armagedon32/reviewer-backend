@@ -2,9 +2,9 @@ fastapi
 uvicorn
 python-jose
 passlib[bcrypt]
-sqlalchemy
-psycopg2-binary
-alembic
+bcrypt<4
+motor
 python-dotenv
 email-validator
 python-multipart
+pymongo

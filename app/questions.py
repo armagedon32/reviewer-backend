@@ -1,8 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel, validator
-from sqlalchemy.orm import Session
 from .auth import get_current_user
-from .database import get_db
+from .database import get_database
 from .db_models import Question
 import csv
 import io
@@ -38,16 +37,16 @@ def normalize_subject(subject: str) -> str:
     return subj
 
 
-def question_to_dict(question: Question):
+def question_to_dict(question: dict):
     return {
-        "id": question.id,
-        "exam_type": question.exam_type,
-        "subject": question.subject,
-        "topic": question.topic,
-        "difficulty": question.difficulty,
-        "question": question.question,
-        "a": question.a,
-        "b": question.b,
+        "id": str(question["_id"]),
+        "exam_type": question["exam_type"],
+        "subject": question["subject"],
+        "topic": question["topic"],
+        "difficulty": question["difficulty"],
+        "question": question["question"],
+        "a": question["a"],
+        "b": question["b"],
         "c": question.c,
         "d": question.d,
         "answer": question.answer,
@@ -202,31 +201,30 @@ DEFAULT_QUESTIONS = [
 ]
 
 
-def seed_questions(db: Session):
-    if db.query(Question).count() > 0:
+async def seed_questions(db):
+    count = await db.questions.count_documents({})
+    if count > 0:
         return
     for item in DEFAULT_QUESTIONS:
-        question = Question(**item)
-        db.add(question)
-    db.commit()
+        await db.questions.insert_one(item)
 
 
 @router.get("")
-def list_questions(
+async def list_questions(
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] not in {"instructor", "admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
-    questions = db.query(Question).all()
+    questions = await db.questions.find().to_list(length=None)
     return [question_to_dict(q) for q in questions]
 
 
 @router.post("")
-def add_question(
+async def add_question(
     payload: QuestionCreate,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] not in {"instructor", "admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -235,41 +233,39 @@ def add_question(
     if payload.difficulty not in allowed_difficulty:
         raise HTTPException(status_code=400, detail="Invalid difficulty")
 
-    question = Question(
-        exam_type=payload.exam_type,
-        subject=normalize_subject(payload.subject),
-        topic=payload.topic,
-        difficulty=payload.difficulty,
-        question=payload.question,
-        a=payload.a,
-        b=payload.b,
-        c=payload.c,
-        d=payload.d,
-        answer=payload.answer,
-    )
-    db.add(question)
-    db.commit()
+    question_data = {
+        "exam_type": payload.exam_type,
+        "subject": normalize_subject(payload.subject),
+        "topic": payload.topic,
+        "difficulty": payload.difficulty,
+        "question": payload.question,
+        "a": payload.a,
+        "b": payload.b,
+        "c": payload.c,
+        "d": payload.d,
+        "answer": payload.answer,
+    }
+    result = await db.questions.insert_one(question_data)
     db.refresh(question)
     return question_to_dict(question)
 
 
 @router.delete("")
-def clear_questions(
+async def clear_questions(
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] not in {"instructor", "admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
-    deleted = db.query(Question).delete()
-    db.commit()
-    return {"deleted": deleted}
+    result = await db.questions.delete_many({})
+    return {"deleted": result.deleted_count}
 
 
 @router.post("/upload")
 async def upload_questions_csv(
     file: UploadFile = File(...),
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db = Depends(get_database),
 ):
     if current_user["role"] not in {"instructor", "admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -308,21 +304,19 @@ async def upload_questions_csv(
             continue
         if row["difficulty"] not in {"Easy", "Medium", "Hard"}:
             continue
-        question = Question(
-            exam_type=row["exam_type"],
-            subject=normalize_subject(row["subject"]),
-            topic=row["topic"],
-            difficulty=row["difficulty"],
-            question=row["question"],
-            a=row["a"],
-            b=row["b"],
-            c=row["c"],
-            d=row["d"],
-            answer=row["answer"],
-        )
-        db.add(question)
+        question_data = {
+            "exam_type": row["exam_type"],
+            "subject": normalize_subject(row["subject"]),
+            "topic": row["topic"],
+            "difficulty": row["difficulty"],
+            "question": row["question"],
+            "a": row["a"],
+            "b": row["b"],
+            "c": row["c"],
+            "d": row["d"],
+            "answer": row["answer"],
+        }
+        await db.questions.insert_one(question_data)
         added += 1
-
-    db.commit()
 
     return {"added": added}
