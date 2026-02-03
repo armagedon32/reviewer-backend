@@ -103,6 +103,7 @@ class AppSetting(BaseModel):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     exam_time_limit_minutes: int = 90
     exam_question_count: int = 50
+    exam_major_question_count: int = 50
 
     class Config:
         populate_by_name = True

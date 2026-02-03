@@ -19,6 +19,7 @@ TEMP_PASSWORD_TTL_MINUTES = 15
 class SettingsUpdate(BaseModel):
     exam_time_limit_minutes: int = Field(ge=10, le=240)
     exam_question_count: int = Field(ge=10, le=200)
+    exam_major_question_count: int = Field(ge=0, le=200)
 
 
 class CreateUserRequest(BaseModel):
@@ -26,6 +27,10 @@ class CreateUserRequest(BaseModel):
     role: Literal["student", "instructor", "admin"]
     password: Optional[str] = None
     require_password_change: bool = True
+
+
+class ResetSelectedExamsRequest(BaseModel):
+    user_ids: list[str] = Field(default_factory=list, min_items=1)
 
 
 def _generate_temp_password(length: int = 12) -> str:
@@ -37,7 +42,11 @@ async def get_or_create_settings(db):
     settings = await db.app_settings.find_one({})
     if settings:
         return settings
-    settings_data = {"exam_time_limit_minutes": 90, "exam_question_count": 50}
+    settings_data = {
+        "exam_time_limit_minutes": 90,
+        "exam_question_count": 50,
+        "exam_major_question_count": 50,
+    }
     result = await db.app_settings.insert_one(settings_data)
     settings_data["_id"] = result.inserted_id
     return settings_data
@@ -51,6 +60,7 @@ async def get_settings(current_user=Depends(get_current_user), db = Depends(get_
     return {
         "exam_time_limit_minutes": settings["exam_time_limit_minutes"],
         "exam_question_count": settings["exam_question_count"],
+        "exam_major_question_count": settings.get("exam_major_question_count", 50),
     }
 
 
@@ -63,6 +73,7 @@ async def get_settings_public(
     return {
         "exam_time_limit_minutes": settings["exam_time_limit_minutes"],
         "exam_question_count": settings["exam_question_count"],
+        "exam_major_question_count": settings.get("exam_major_question_count", 50),
     }
 
 
@@ -83,12 +94,21 @@ async def update_settings(
                 f"Requested {payload.exam_question_count}, but only {total_questions} available."
             ),
         )
+    if payload.exam_major_question_count > total_questions:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Major item count exceeds the available question bank. "
+                f"Requested {payload.exam_major_question_count}, but only {total_questions} available."
+            ),
+        )
     settings = await get_or_create_settings(db)
     await db.app_settings.update_one(
         {"_id": settings["_id"]},
         {"$set": {
             "exam_time_limit_minutes": payload.exam_time_limit_minutes,
-            "exam_question_count": payload.exam_question_count
+            "exam_question_count": payload.exam_question_count,
+            "exam_major_question_count": payload.exam_major_question_count,
         }}
     )
     await log_event_async(
@@ -97,13 +117,15 @@ async def update_settings(
         "settings_update",
         (
             f"Exam timer set to {payload.exam_time_limit_minutes} minutes; "
-            f"exam questions set to {payload.exam_question_count}"
+            f"exam questions set to {payload.exam_question_count}; "
+            f"major questions set to {payload.exam_major_question_count}"
         ),
     )
     updated_settings = await db.app_settings.find_one({"_id": settings["_id"]})
     return {
         "exam_time_limit_minutes": updated_settings["exam_time_limit_minutes"],
         "exam_question_count": updated_settings["exam_question_count"],
+        "exam_major_question_count": updated_settings.get("exam_major_question_count", 50),
     }
 
 
@@ -233,6 +255,48 @@ async def reset_user_exams(
     await log_event_async(db, user_id, "exam_reset", f"Deleted {result.deleted_count} exam results")
     return {"deleted": result.deleted_count}
 
+
+@router.delete("/exams/students")
+async def reset_student_exams(
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    students = await db.users.find({"role": "student"}).to_list(length=None)
+    student_ids = [str(user["_id"]) for user in students]
+    if not student_ids:
+        return {"deleted": 0}
+    result = await db.exam_results.delete_many({"user_id": {"$in": student_ids}})
+    await log_event_async(db, None, "exam_reset_bulk", f"Deleted {result.deleted_count} student exam results")
+    return {"deleted": result.deleted_count}
+
+
+@router.post("/exams/students/selected")
+async def reset_selected_student_exams(
+    payload: ResetSelectedExamsRequest,
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    from bson import ObjectId
+    try:
+        object_ids = [ObjectId(uid) for uid in payload.user_ids]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user id list")
+    users = await db.users.find({"_id": {"$in": object_ids}, "role": "student"}).to_list(length=None)
+    student_ids = [str(user["_id"]) for user in users]
+    if not student_ids:
+        return {"deleted": 0}
+    result = await db.exam_results.delete_many({"user_id": {"$in": student_ids}})
+    await log_event_async(
+        db,
+        None,
+        "exam_reset_selected",
+        f"Deleted {result.deleted_count} exam results for {len(student_ids)} students",
+    )
+    return {"deleted": result.deleted_count, "students": len(student_ids)}
 
 @router.post("/users/{user_id}/password-reset")
 async def reset_user_password(

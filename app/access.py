@@ -7,7 +7,7 @@ from .database import get_database
 from .db_models import AuditLog, User
 from .audit import log_event_async
 
-REQUEST_TTL_SECONDS = 60 * 60
+REQUEST_TTL_SECONDS = 60 * 60 * 24 * 7
 ACCESS_ACTIONS = ("access_request", "access_approved", "access_denied")
 
 router = APIRouter(prefix="/access", tags=["Access"])
