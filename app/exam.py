@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -158,6 +158,92 @@ def major_label_for_profile(profile: dict) -> str:
     if let_track:
         return let_track
     return "Unspecified"
+
+DIFFICULTY_LEVELS = ("Easy", "Medium", "Hard")
+DEFAULT_DIFFICULTY_MIX = {"Easy": 0.40, "Medium": 0.40, "Hard": 0.20}
+PASS_DIFFICULTY_MIX = {"Easy": 0.20, "Medium": 0.40, "Hard": 0.40}
+FAIL_DIFFICULTY_MIX = {"Easy": 0.60, "Medium": 0.30, "Hard": 0.10}
+
+
+def difficulty_mix_for_result(latest_result):
+    if not latest_result:
+        return DEFAULT_DIFFICULTY_MIX
+    result = (latest_result.get("result") or "").upper()
+    if result == "PASS":
+        return PASS_DIFFICULTY_MIX
+    if result == "FAIL":
+        return FAIL_DIFFICULTY_MIX
+    return DEFAULT_DIFFICULTY_MIX
+
+
+def allocate_by_weight(total, weights):
+    if total <= 0:
+        return {level: 0 for level in DIFFICULTY_LEVELS}
+    raw = {level: total * float(weights.get(level, 0)) for level in DIFFICULTY_LEVELS}
+    counts = {level: int(raw[level]) for level in DIFFICULTY_LEVELS}
+    remainder = total - sum(counts.values())
+    fractional = sorted(
+        [(level, raw[level] - counts[level]) for level in DIFFICULTY_LEVELS],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    for level, _ in fractional:
+        if remainder <= 0:
+            break
+        counts[level] += 1
+        remainder -= 1
+    return counts
+
+
+def select_questions_with_mix(pool, total, weights):
+    if total <= 0:
+        return []
+    if len(pool) < total:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Not enough questions available for this track. "
+                f"Needed {total}, but only {len(pool)} available."
+            ),
+        )
+
+    groups = {level: [] for level in DIFFICULTY_LEVELS}
+    for q in pool:
+        diff = q.get("difficulty")
+        if diff in groups:
+            groups[diff].append(q)
+
+    desired = allocate_by_weight(total, weights)
+    selected = []
+    selected_ids = set()
+
+    for level in DIFFICULTY_LEVELS:
+        need = desired.get(level, 0)
+        options = [q for q in groups.get(level, []) if q["_id"] not in selected_ids]
+        if need <= 0:
+            continue
+        if len(options) <= need:
+            chosen = options
+        else:
+            chosen = random.sample(options, need)
+        selected.extend(chosen)
+        selected_ids.update({q["_id"] for q in chosen})
+
+    remaining = total - len(selected)
+    if remaining > 0:
+        remaining_pool = [q for q in pool if q["_id"] not in selected_ids]
+        if len(remaining_pool) < remaining:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Not enough questions available for this track. "
+                    f"Needed {total}, but only {len(pool)} available."
+                ),
+            )
+        selected.extend(random.sample(remaining_pool, remaining))
+
+    return selected
+
 @router.post("/start")
 async def start_exam(
     current_user=Depends(get_current_user),
@@ -201,6 +287,14 @@ async def start_exam(
             )
         extra_major_count = major_setting
     total_questions = base_total + extra_major_count
+
+    latest_result = (
+        await db.exam_results.find({"user_id": str(user["_id"]), "exam_type": exam_type})
+        .sort("created_at", -1)
+        .limit(1)
+        .to_list(length=1)
+    )
+    difficulty_mix = difficulty_mix_for_result(latest_result[0] if latest_result else None)
 
     extra_major_ids = set()
     if exam_type == "LET":
@@ -252,7 +346,7 @@ async def start_exam(
                         f"Needed {counts[label]} from {label}, but only {len(pool)} available."
                     ),
                 )
-            chosen = random.sample(pool, counts[label])
+            chosen = select_questions_with_mix(pool, counts[label], difficulty_mix)
             selected.extend(chosen)
             selected_ids.update({q["_id"] for q in chosen})
 
@@ -267,34 +361,14 @@ async def start_exam(
                         f"Needed {extra_major_count} from Major, but only {len(major_pool)} available."
                     ),
                 )
-            extra_chosen = random.sample(major_pool, extra_major_count)
+            extra_chosen = select_questions_with_mix(major_pool, extra_major_count, difficulty_mix)
             selected.extend(extra_chosen)
             extra_major_ids.update({q["_id"] for q in extra_chosen})
             selected_ids.update(extra_major_ids)
 
         exam_questions = selected
     else:
-        exam_questions = random.sample(question_list, total_questions)
-
-    response = []
-    major_label = (profile.get("major_specialization") or "").strip()
-    for q in exam_questions:
-        bucket = subject_bucket_for(q, profile)
-        is_extra = bool(extra_major_count and q["_id"] in extra_major_ids and bucket == major_label)
-        response.append(
-            {
-                "id": str(q["_id"]),
-                "question": q["question"],
-                "a": q["a"],
-                "b": q["b"],
-                "c": q["c"],
-                "d": q["d"],
-                "difficulty": q["difficulty"],
-                "section": section_label_for(bucket, major_label, extra_major=is_extra),
-            }
-        )
-    return response
-
+        exam_questions = select_questions_with_mix(question_list, total_questions, difficulty_mix)
 
 class ExamSubmission(BaseModel):
     answers: dict  # { question_id: "A" | "B" | "C" | "D" }
@@ -513,3 +587,7 @@ async def get_exam_history(
         }
         for result in results
     ]
+
+
+
+
