@@ -276,7 +276,11 @@ async def start_exam(
 
     settings = await db.app_settings.find_one({})
     base_total = settings["exam_question_count"] if settings else 50
+    if not base_total or base_total < 1:
+        base_total = 50
     major_setting = settings.get("exam_major_question_count", 50) if settings else 50
+    if major_setting is None or major_setting < 0:
+        major_setting = 0
     major = (profile.get("major_specialization") or "").strip()
     extra_major_count = 0
     if exam_type == "LET" and not is_elementary:
@@ -287,6 +291,7 @@ async def start_exam(
             )
         extra_major_count = major_setting
     total_questions = base_total + extra_major_count
+
 
     latest_result = (
         await db.exam_results.find({"user_id": str(user["_id"]), "exam_type": exam_type})
@@ -310,65 +315,101 @@ async def start_exam(
             if bucket in buckets:
                 buckets[bucket].append(q)
 
-        # Percent split for base total: GenEd 50%, ProfEd 50%
-        splits = [
-            (GENED_LABEL, 0.50),
-            (PROFED_LABEL, 0.50),
-        ]
+        available_core = len(buckets.get(GENED_LABEL, [])) + len(buckets.get(PROFED_LABEL, []))
+        if available_core == 0:
+            exam_questions = select_questions_with_mix(question_list, total_questions, difficulty_mix)
+        else:
+            # Percent split for base total: GenEd 50%, ProfEd 50%
+            splits = [
+                (GENED_LABEL, 0.50),
+                (PROFED_LABEL, 0.50),
+            ]
 
-        # Compute target counts with rounding, then fix remainder.
-        counts = {}
-        fractional = []
-        allocated = 0
-        for label, pct in splits:
-            raw = base_total * pct
-            count = int(raw)
-            counts[label] = count
-            allocated += count
-            fractional.append((label, raw - count))
-        remainder = base_total - allocated
-        for label, _ in sorted(fractional, key=lambda x: x[1], reverse=True):
-            if remainder <= 0:
-                break
-            counts[label] += 1
-            remainder -= 1
+            # Compute target counts with rounding, then fix remainder.
+            counts = {}
+            fractional = []
+            allocated = 0
+            for label, pct in splits:
+                raw = base_total * pct
+                count = int(raw)
+                counts[label] = count
+                allocated += count
+                fractional.append((label, raw - count))
+            remainder = base_total - allocated
+            for label, _ in sorted(fractional, key=lambda x: x[1], reverse=True):
+                if remainder <= 0:
+                    break
+                counts[label] += 1
+                remainder -= 1
 
-        selected = []
-        selected_ids = set()
-        extra_major_ids = set()
-        for label in counts:
-            pool = [q for q in buckets.get(label, []) if q["_id"] not in selected_ids]
-            if len(pool) < counts[label]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Not enough questions available for this track. "
-                        f"Needed {counts[label]} from {label}, but only {len(pool)} available."
-                    ),
-                )
-            chosen = select_questions_with_mix(pool, counts[label], difficulty_mix)
-            selected.extend(chosen)
-            selected_ids.update({q["_id"] for q in chosen})
+            selected = []
+            selected_ids = set()
+            extra_major_ids = set()
+            for label in counts:
+                pool = [q for q in buckets.get(label, []) if q["_id"] not in selected_ids]
+                take = min(counts[label], len(pool))
+                if take <= 0:
+                    continue
+                chosen = select_questions_with_mix(pool, take, difficulty_mix)
+                selected.extend(chosen)
+                selected_ids.update({q["_id"] for q in chosen})
 
-        # Add extra major questions if applicable
-        if major and extra_major_count:
-            major_pool = [q for q in buckets.get(major, []) if q["_id"] not in selected_ids]
-            if len(major_pool) < extra_major_count:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Not enough questions available for this track. "
-                        f"Needed {extra_major_count} from Major, but only {len(major_pool)} available."
-                    ),
-                )
-            extra_chosen = select_questions_with_mix(major_pool, extra_major_count, difficulty_mix)
-            selected.extend(extra_chosen)
-            extra_major_ids.update({q["_id"] for q in extra_chosen})
-            selected_ids.update(extra_major_ids)
+            remaining_core = base_total - len(selected)
+            if remaining_core > 0:
+                core_pool = []
+                for label in (GENED_LABEL, PROFED_LABEL):
+                    core_pool.extend(buckets.get(label, []))
+                core_pool = [q for q in core_pool if q["_id"] not in selected_ids]
+                if len(core_pool) < remaining_core:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Not enough questions available for this track. "
+                            f"Needed {base_total} from GenEd/ProfEd, but only {base_total - remaining_core + len(core_pool)} available."
+                        ),
+                    )
+                core_chosen = select_questions_with_mix(core_pool, remaining_core, difficulty_mix)
+                selected.extend(core_chosen)
+                selected_ids.update({q["_id"] for q in core_chosen})
 
-        exam_questions = selected
+            # Add extra major questions if applicable
+            if major and extra_major_count:
+                major_pool = [q for q in buckets.get(major, []) if q["_id"] not in selected_ids]
+                if len(major_pool) < extra_major_count:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Not enough questions available for this track. "
+                            f"Needed {extra_major_count} from Major, but only {len(major_pool)} available."
+                        ),
+                    )
+                extra_chosen = select_questions_with_mix(major_pool, extra_major_count, difficulty_mix)
+                selected.extend(extra_chosen)
+                extra_major_ids.update({q["_id"] for q in extra_chosen})
+                selected_ids.update(extra_major_ids)
+
+            exam_questions = selected
     else:
         exam_questions = select_questions_with_mix(question_list, total_questions, difficulty_mix)
+
+    response = []
+    major_label = (profile.get("major_specialization") or "").strip()
+    for q in exam_questions:
+        bucket = subject_bucket_for(q, profile)
+        is_extra = bool(extra_major_count and q["_id"] in extra_major_ids and bucket == major_label)
+        response.append(
+            {
+                "id": str(q["_id"]),
+                "question": q["question"],
+                "a": q["a"],
+                "b": q["b"],
+                "c": q["c"],
+                "d": q["d"],
+                "difficulty": q["difficulty"],
+                "section": section_label_for(bucket, major_label, extra_major=is_extra),
+            }
+        )
+    return response
 
 class ExamSubmission(BaseModel):
     answers: dict  # { question_id: "A" | "B" | "C" | "D" }
