@@ -27,8 +27,8 @@ class StudentProfile(BaseModel):
     year_level: Optional[int] = Field(default=None, ge=1, le=6)
     section_class: Optional[str] = None
     status: Literal["Active", "Inactive", "Graduated"]
-    target_licensure: Literal["LET", "CPA", "Internal Certification"]
-    let_track: Optional[Literal["Elementary", "Secondary"]] = None
+    target_licensure: str
+    let_track: Optional[str] = None
     major_specialization: str
     assigned_review_subjects: List[str]
     required_passing_threshold: int = Field(ge=1, le=100)

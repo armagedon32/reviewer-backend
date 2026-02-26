@@ -104,6 +104,9 @@ class AppSetting(BaseModel):
     exam_time_limit_minutes: int = 90
     exam_question_count: int = 50
     exam_major_question_count: int = 50
+    passing_threshold_default: int = 75
+    mastery_threshold: int = 90
+    target_licensure_options: List[Dict[str, Any]] = Field(default_factory=list)
 
     class Config:
         populate_by_name = True

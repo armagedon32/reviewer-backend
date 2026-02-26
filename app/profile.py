@@ -5,24 +5,9 @@ from .auth import get_current_user
 from .database import get_database
 from .db_models import StudentProfile, User
 from .audit import log_event_async
+from .licensure import DEFAULT_TARGET_LICENSURE_OPTIONS
 
 router = APIRouter(prefix="/profile", tags=["Profile"])
-
-LICENSURE_RULES = {
-    "LET": {
-        "subjects": ["GenEd", "ProfEd", "Specialization"],
-        "passing_threshold": 75,
-    },
-    "CPA": {
-        "subjects": ["FAR", "AFAR", "Auditing", "MAS", "RFBT", "Taxation"],
-        "passing_threshold": 75,
-    },
-    "Internal Certification": {
-        "subjects": ["Core", "Applied", "Practicum"],
-        "passing_threshold": 80,
-    },
-}
-
 
 def profile_to_dict(profile):
     return {
@@ -70,7 +55,21 @@ async def save_profile(
     if profile.email_address.lower() != user["email"].lower():
         raise HTTPException(status_code=400, detail="Email must match account email")
 
-    rule = LICENSURE_RULES.get(profile.target_licensure)
+    app_settings = await db.app_settings.find_one({}) or {}
+    licensure_options = app_settings.get("target_licensure_options") or DEFAULT_TARGET_LICENSURE_OPTIONS
+    licensure_rules = {}
+    for option in licensure_options:
+        name = str(option.get("name", "")).strip()
+        subjects = [str(subject).strip() for subject in option.get("subjects", []) if str(subject).strip()]
+        threshold = option.get("passing_threshold", 75)
+        if not name or not subjects:
+            continue
+        licensure_rules[name] = {
+            "subjects": subjects,
+            "passing_threshold": int(threshold),
+        }
+
+    rule = licensure_rules.get(profile.target_licensure)
     if not rule:
         raise HTTPException(status_code=400, detail="Invalid target licensure")
 
