@@ -26,6 +26,7 @@ def profile_to_dict(profile):
         "major_specialization": profile["major_specialization"],
         "assigned_review_subjects": profile["assigned_review_subjects"],
         "required_passing_threshold": profile["required_passing_threshold"],
+        "can_edit_profile": bool(profile.get("can_edit_profile", False)),
     }
 
 
@@ -39,7 +40,10 @@ async def get_profile(
         raise HTTPException(status_code=401, detail="User not found")
 
     profile = await db.student_profiles.find_one({"user_id": str(user["_id"])})
-    return profile_to_dict(profile) if profile else None
+    if not profile:
+        return None
+    profile["can_edit_profile"] = bool(user.get("profile_edit_allowed", False))
+    return profile_to_dict(profile)
 
 
 @router.post("")
@@ -64,14 +68,17 @@ async def save_profile(
         threshold = option.get("passing_threshold", 75)
         if not name or not subjects:
             continue
-        licensure_rules[name] = {
+        licensure_rules[name.lower()] = {
+            "name": name,
             "subjects": subjects,
             "passing_threshold": int(threshold),
         }
 
-    rule = licensure_rules.get(profile.target_licensure)
+    target_licensure_name = str(profile.target_licensure or "").strip()
+    rule = licensure_rules.get(target_licensure_name.lower())
     if not rule:
         raise HTTPException(status_code=400, detail="Invalid target licensure")
+    profile.target_licensure = rule["name"]
 
     if profile.target_licensure == "LET":
         if profile.let_track not in {"Elementary", "Secondary"}:
@@ -83,6 +90,8 @@ async def save_profile(
             profile.major_specialization = "Elementary"
     else:
         profile.let_track = None
+        if not (profile.major_specialization or "").strip():
+            profile.major_specialization = profile.target_licensure
 
     expected_threshold = rule["passing_threshold"]
     if profile.required_passing_threshold != expected_threshold:
@@ -112,6 +121,11 @@ async def save_profile(
 
     existing = await db.student_profiles.find_one({"user_id": str(user["_id"])})
     if existing:
+        if not user.get("profile_edit_allowed", False):
+            raise HTTPException(
+                status_code=403,
+                detail="Profile editing is disabled. Ask admin for permission.",
+            )
         await db.student_profiles.update_one(
             {"_id": existing["_id"]},
             {"$set": {
@@ -132,6 +146,10 @@ async def save_profile(
                 "required_passing_threshold": profile.required_passing_threshold,
                 "updated_at": datetime.utcnow()
             }}
+        )
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"profile_edit_allowed": False}},
         )
         saved = await db.student_profiles.find_one({"_id": existing["_id"]})
     else:

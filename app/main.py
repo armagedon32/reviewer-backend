@@ -6,6 +6,7 @@ from .exam import router as exam_router
 from .questions import router as questions_router, seed_questions
 from .admin import router as admin_router
 from .access import router as access_router
+from .recommend import router as recommend_router
 from .database import get_database
 from .admin import get_or_create_settings
 from .auth import ensure_admin_user
@@ -54,3 +55,4 @@ app.include_router(exam_router)
 app.include_router(questions_router)
 app.include_router(admin_router)
 app.include_router(access_router)
+app.include_router(recommend_router)

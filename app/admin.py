@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, EmailStr
+from bson import ObjectId
 from .auth import get_current_user, hash_password
 from .database import get_database
 from .db_models import AppSetting, AuditLog, ExamResult, Question, User
@@ -99,6 +100,7 @@ class SettingsUpdate(BaseModel):
     passing_threshold_default: int = Field(ge=1, le=100)
     mastery_threshold: int = Field(ge=1, le=100)
     target_licensure_options: list[dict] = Field(default_factory=list)
+    rl_enabled: bool = False
 
 
 class CreateUserRequest(BaseModel):
@@ -110,6 +112,14 @@ class CreateUserRequest(BaseModel):
 
 class ResetSelectedExamsRequest(BaseModel):
     user_ids: list[str] = Field(default_factory=list, min_items=1)
+
+
+class CertificationApprovalRequest(BaseModel):
+    override: bool = False
+
+
+class ProfileEditPermissionRequest(BaseModel):
+    allowed: bool = True
 
 
 def _generate_temp_password(length: int = 12) -> str:
@@ -134,6 +144,14 @@ async def get_or_create_settings(db):
         ):
             settings["target_licensure_options"] = DEFAULT_TARGET_LICENSURE_OPTIONS
             needs_update = True
+        else:
+            merged_options = _merge_default_licensure_options(settings["target_licensure_options"])
+            if len(merged_options) != len(settings["target_licensure_options"]):
+                settings["target_licensure_options"] = merged_options
+                needs_update = True
+        if "rl_enabled" not in settings:
+            settings["rl_enabled"] = False
+            needs_update = True
         if needs_update:
             await db.app_settings.update_one(
                 {"_id": settings["_id"]},
@@ -141,6 +159,7 @@ async def get_or_create_settings(db):
                     "passing_threshold_default": settings["passing_threshold_default"],
                     "mastery_threshold": settings["mastery_threshold"],
                     "target_licensure_options": settings["target_licensure_options"],
+                    "rl_enabled": settings["rl_enabled"],
                 }},
             )
         return settings
@@ -151,6 +170,7 @@ async def get_or_create_settings(db):
         "passing_threshold_default": 75,
         "mastery_threshold": 90,
         "target_licensure_options": DEFAULT_TARGET_LICENSURE_OPTIONS,
+        "rl_enabled": False,
     }
     result = await db.app_settings.insert_one(settings_data)
     settings_data["_id"] = result.inserted_id
@@ -195,6 +215,98 @@ def _normalize_licensure_options(options: list[dict]) -> list[dict]:
     return cleaned
 
 
+def _merge_default_licensure_options(existing: list[dict]) -> list[dict]:
+    merged = list(existing or [])
+    existing_names = {
+        str(item.get("name", "")).strip().lower()
+        for item in merged
+        if isinstance(item, dict)
+    }
+    for default_option in DEFAULT_TARGET_LICENSURE_OPTIONS:
+        default_name = str(default_option.get("name", "")).strip().lower()
+        if default_name and default_name not in existing_names:
+            merged.append(default_option)
+    return merged
+
+
+def _generate_certificate_id(seed: str) -> str:
+    compact = "".join(ch for ch in seed.upper() if ch.isalnum())
+    suffix = compact[-10:] if compact else secrets.token_hex(5).upper()
+    return f"RUI-{suffix}"
+
+
+def _generate_verification_code() -> str:
+    return f"VRF-{secrets.token_hex(6).upper()}"
+
+
+def _safe_object_id(value: str):
+    if not ObjectId.is_valid(value):
+        raise HTTPException(status_code=400, detail="Invalid identifier")
+    return ObjectId(value)
+
+
+def _to_iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else None
+
+
+async def _student_cert_snapshot(db, user: dict, settings: dict) -> dict:
+    profile = await db.student_profiles.find_one({"user_id": str(user["_id"])})
+    if not profile:
+        return {}
+
+    target = str(profile.get("target_licensure") or "").strip().upper()
+    threshold = int(
+        profile.get("required_passing_threshold")
+        or settings.get("passing_threshold_default")
+        or 75
+    )
+    exam_results = await db.exam_results.find(
+        {"user_id": str(user["_id"])}
+    ).sort("created_at", -1).to_list(length=200)
+    relevant = [
+        row for row in exam_results if str(row.get("exam_type") or "").strip().upper() == target
+    ]
+    if not relevant:
+        relevant = exam_results
+
+    percentages = [float(row.get("percentage") or 0) for row in relevant]
+    average_score = round(sum(percentages) / len(percentages), 2) if percentages else 0.0
+    latest_score = percentages[0] if percentages else 0.0
+    highest_score = max(percentages) if percentages else 0.0
+
+    consecutive_passes = 0
+    for row in relevant:
+        if float(row.get("percentage") or 0) >= threshold:
+            consecutive_passes += 1
+        else:
+            break
+
+    eligible = consecutive_passes >= 3
+    full_name = " ".join(
+        part for part in [
+            profile.get("first_name", ""),
+            profile.get("middle_name", ""),
+            profile.get("last_name", ""),
+        ] if str(part).strip()
+    ).strip()
+    if not full_name:
+        full_name = profile.get("username") or user.get("email") or "Learner"
+
+    return {
+        "user_id": str(user["_id"]),
+        "learner_name": full_name,
+        "email": user.get("email"),
+        "category": profile.get("target_licensure") or "N/A",
+        "required_threshold": threshold,
+        "attempt_count": len(relevant),
+        "latest_score": round(latest_score, 2),
+        "highest_score": round(highest_score, 2),
+        "average_score": average_score,
+        "consecutive_passes": consecutive_passes,
+        "eligible": eligible,
+    }
+
+
 @router.get("/settings")
 async def get_settings(current_user=Depends(get_current_user), db = Depends(get_database)):
     if current_user["role"] != "admin":
@@ -209,6 +321,7 @@ async def get_settings(current_user=Depends(get_current_user), db = Depends(get_
         "target_licensure_options": settings.get(
             "target_licensure_options", DEFAULT_TARGET_LICENSURE_OPTIONS
         ),
+        "rl_enabled": bool(settings.get("rl_enabled", False)),
     }
 
 
@@ -227,6 +340,7 @@ async def get_settings_public(
         "target_licensure_options": settings.get(
             "target_licensure_options", DEFAULT_TARGET_LICENSURE_OPTIONS
         ),
+        "rl_enabled": bool(settings.get("rl_enabled", False)),
     }
 
 
@@ -266,6 +380,7 @@ async def update_settings(
             "passing_threshold_default": payload.passing_threshold_default,
             "mastery_threshold": payload.mastery_threshold,
             "target_licensure_options": target_licensure_options,
+            "rl_enabled": payload.rl_enabled,
         }}
     )
     await log_event_async(
@@ -276,7 +391,8 @@ async def update_settings(
             f"Exam timer set to {payload.exam_time_limit_minutes} minutes; "
             f"exam questions set to {payload.exam_question_count}; "
             f"major questions set to {payload.exam_major_question_count}; "
-            f"licensure categories: {len(target_licensure_options)}"
+            f"licensure categories: {len(target_licensure_options)}; "
+            f"rl_enabled: {payload.rl_enabled}"
         ),
     )
     updated_settings = await db.app_settings.find_one({"_id": settings["_id"]})
@@ -289,6 +405,7 @@ async def update_settings(
         "target_licensure_options": updated_settings.get(
             "target_licensure_options", DEFAULT_TARGET_LICENSURE_OPTIONS
         ),
+        "rl_enabled": bool(updated_settings.get("rl_enabled", False)),
     }
 
 
@@ -303,6 +420,7 @@ async def list_users(current_user=Depends(get_current_user), db = Depends(get_da
             "email": user["email"],
             "role": user["role"],
             "active": user.get("active", True),
+            "profile_edit_allowed": bool(user.get("profile_edit_allowed", False)),
             "created_at": user["created_at"].isoformat(),
         }
         for user in users
@@ -339,6 +457,7 @@ async def create_user(
         "password_hash": hash_password(password_to_set),
         "role": payload.role,
         "active": True,
+        "profile_edit_allowed": False,
         "must_change_password": must_change_password,
         "temp_password_expires_at": expires_at,
         "created_at": datetime.utcnow(),
@@ -350,6 +469,7 @@ async def create_user(
         "email": payload.email,
         "role": payload.role,
         "active": True,
+        "profile_edit_allowed": False,
         "created_at": user_data["created_at"].isoformat(),
     }
     if generated_password:
@@ -379,6 +499,33 @@ async def update_user_status(
         f"User {'activated' if active else 'deactivated'}",
     )
     return {"id": user_id, "active": active}
+
+
+@router.post("/users/{user_id}/profile-edit-permission")
+async def set_profile_edit_permission(
+    user_id: str,
+    payload: ProfileEditPermissionRequest,
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.get("role") != "student":
+        raise HTTPException(status_code=400, detail="Only student profiles are controlled here")
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"profile_edit_allowed": bool(payload.allowed)}},
+    )
+    await log_event_async(
+        db,
+        user_id,
+        "profile_edit_permission",
+        f"Profile edit permission set to {bool(payload.allowed)}",
+    )
+    return {"id": user_id, "profile_edit_allowed": bool(payload.allowed)}
 
 
 @router.delete("/users/{user_id}")
@@ -619,6 +766,204 @@ async def deny_access_request(
     await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"active": False}})
     await log_event_async(db, user_id, "access_denied", "Access denied")
     return {"id": user_id, "status": "denied"}
+
+
+@router.get("/certifications")
+async def list_certification_management_data(
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    settings = await get_or_create_settings(db)
+    users = await db.users.find({"role": "student"}).to_list(length=None)
+    snapshots = []
+    for user in users:
+        snapshot = await _student_cert_snapshot(db, user, settings)
+        if snapshot:
+            snapshots.append(snapshot)
+
+    certificates_raw = await db.certificates.find().sort("created_at", -1).to_list(length=500)
+    issued = []
+    issued_by_user = {}
+    for cert in certificates_raw:
+        uid = cert.get("user_id")
+        if uid and uid not in issued_by_user and cert.get("status") == "Issued":
+            issued_by_user[uid] = cert
+        issued.append(
+            {
+                "id": str(cert.get("_id")),
+                "certificate_id": cert.get("certificate_id"),
+                "user_id": cert.get("user_id"),
+                "learner_name": cert.get("learner_name"),
+                "category": cert.get("category"),
+                "issue_date": _to_iso(cert.get("issue_date")),
+                "verification_code": cert.get("verification_code"),
+                "status": cert.get("status", "Issued"),
+                "override": bool(cert.get("override", False)),
+                "created_at": _to_iso(cert.get("created_at")),
+                "revoked_at": _to_iso(cert.get("revoked_at")),
+            }
+        )
+
+    pending = []
+    streaks = []
+    for snapshot in snapshots:
+        streaks.append(snapshot)
+        if snapshot["eligible"] and snapshot["user_id"] not in issued_by_user:
+            pending.append(snapshot)
+
+    return {
+        "issued_certificates": issued,
+        "pending_eligibility": pending,
+        "consecutive_results": streaks,
+    }
+
+
+@router.post("/certifications/{user_id}/approve")
+async def approve_certification_eligibility(
+    user_id: str,
+    payload: CertificationApprovalRequest,
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    user = await db.users.find_one({"_id": _safe_object_id(user_id), "role": "student"})
+    if not user:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    settings = await get_or_create_settings(db)
+    snapshot = await _student_cert_snapshot(db, user, settings)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+
+    existing_issued = await db.certificates.find_one(
+        {"user_id": str(user["_id"]), "status": "Issued"}
+    )
+    if existing_issued:
+        return {
+            "certificate": {
+                "id": str(existing_issued.get("_id")),
+                "certificate_id": existing_issued.get("certificate_id"),
+                "user_id": existing_issued.get("user_id"),
+                "learner_name": existing_issued.get("learner_name"),
+                "category": existing_issued.get("category"),
+                "issue_date": _to_iso(existing_issued.get("issue_date")),
+                "verification_code": existing_issued.get("verification_code"),
+                "status": existing_issued.get("status", "Issued"),
+                "override": bool(existing_issued.get("override", False)),
+            },
+            "message": "Certificate already issued.",
+        }
+
+    if not snapshot["eligible"] and not payload.override:
+        raise HTTPException(
+            status_code=400,
+            detail="Student is not yet eligible. Use override to issue manually.",
+        )
+
+    issue_date = datetime.utcnow()
+    cert_seed = f"{snapshot['user_id']}-{snapshot['category']}-{issue_date.timestamp()}"
+    cert_doc = {
+        "user_id": snapshot["user_id"],
+        "learner_name": snapshot["learner_name"],
+        "category": snapshot["category"],
+        "required_threshold": snapshot["required_threshold"],
+        "average_score": snapshot["average_score"],
+        "consecutive_passes": snapshot["consecutive_passes"],
+        "certificate_id": _generate_certificate_id(cert_seed),
+        "verification_code": _generate_verification_code(),
+        "issue_date": issue_date,
+        "status": "Issued",
+        "override": bool(payload.override),
+        "created_at": issue_date,
+        "issued_by": current_user.get("email"),
+    }
+    created = await db.certificates.insert_one(cert_doc)
+    cert_doc["_id"] = created.inserted_id
+    await log_event_async(
+        db,
+        snapshot["user_id"],
+        "certification_issued",
+        (
+            f"Certificate issued ({cert_doc['certificate_id']}) "
+            f"for {snapshot['category']}; override={bool(payload.override)}"
+        ),
+    )
+    return {
+        "certificate": {
+            "id": str(cert_doc.get("_id")),
+            "certificate_id": cert_doc.get("certificate_id"),
+            "user_id": cert_doc.get("user_id"),
+            "learner_name": cert_doc.get("learner_name"),
+            "category": cert_doc.get("category"),
+            "issue_date": _to_iso(cert_doc.get("issue_date")),
+            "verification_code": cert_doc.get("verification_code"),
+            "status": cert_doc.get("status"),
+            "override": bool(cert_doc.get("override", False)),
+        },
+        "message": "Certificate generated successfully.",
+    }
+
+
+@router.post("/certifications/{certificate_id}/revoke")
+async def revoke_certificate(
+    certificate_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    cert = await db.certificates.find_one({"_id": _safe_object_id(certificate_id)})
+    if not cert:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    if cert.get("status") == "Revoked":
+        return {"revoked": True, "message": "Certificate already revoked."}
+
+    revoked_at = datetime.utcnow()
+    await db.certificates.update_one(
+        {"_id": cert["_id"]},
+        {
+            "$set": {
+                "status": "Revoked",
+                "revoked_at": revoked_at,
+                "revoked_by": current_user.get("email"),
+            }
+        },
+    )
+    await log_event_async(
+        db,
+        cert.get("user_id"),
+        "certification_revoked",
+        f"Certificate revoked ({cert.get('certificate_id')})",
+    )
+    return {"revoked": True, "message": "Certificate revoked."}
+
+
+@router.get("/certifications/verify/{verification_code}")
+async def verify_certificate_code(
+    verification_code: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    cert = await db.certificates.find_one({"verification_code": verification_code})
+    if not cert:
+        raise HTTPException(status_code=404, detail="Verification code not found")
+    return {
+        "certificate_id": cert.get("certificate_id"),
+        "learner_name": cert.get("learner_name"),
+        "category": cert.get("category"),
+        "issue_date": _to_iso(cert.get("issue_date")),
+        "status": cert.get("status", "Issued"),
+        "verification_code": cert.get("verification_code"),
+    }
 
 
 @router.get("/backup/database")

@@ -16,6 +16,78 @@ GENED_LABEL = "General Education"
 PROFED_LABEL = "Professional Education"
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+async def _apply_auto_recommendation_reward(
+    db,
+    user_id: str,
+    exam_type: str,
+    percentage: float,
+    result: str,
+    passing_threshold: float,
+):
+    latest_recommendation = await db.rl_events.find_one(
+        {
+            "user_id": user_id,
+            "event_type": "recommendation",
+            "action_id": {"$exists": True},
+            "rewarded_at": {"$exists": False},
+        },
+        sort=[("created_at", -1)],
+    )
+    if not latest_recommendation:
+        return
+
+    previous_attempt = await db.exam_results.find_one(
+        {"user_id": user_id, "exam_type": exam_type},
+        sort=[("created_at", -1)],
+    )
+    previous_percentage = float(previous_attempt.get("percentage", 0)) if previous_attempt else 0.0
+    previous_result = (previous_attempt.get("result") or "") if previous_attempt else ""
+
+    delta = float(percentage) - previous_percentage
+    reward = _clamp(delta / 20.0, -1.0, 1.0)
+    if result == "PASS" and previous_result != "PASS":
+        reward = _clamp(reward + 0.30, -1.0, 1.0)
+    if result == "FAIL" and previous_result == "PASS":
+        reward = _clamp(reward - 0.30, -1.0, 1.0)
+    if result == "PASS" and delta == 0:
+        reward = _clamp(reward + 0.10, -1.0, 1.0)
+    if result == "FAIL" and delta == 0:
+        reward = _clamp(reward - 0.10, -1.0, 1.0)
+
+    now = datetime.utcnow()
+    await db.rl_events.update_one(
+        {"_id": latest_recommendation["_id"]},
+        {
+            "$set": {
+                "rewarded_at": now,
+                "auto_reward": float(round(reward, 4)),
+                "outcome": {
+                    "exam_type": exam_type,
+                    "previous_percentage": previous_percentage,
+                    "new_percentage": float(percentage),
+                    "previous_result": previous_result,
+                    "new_result": result,
+                    "passing_threshold": float(passing_threshold),
+                },
+            }
+        },
+    )
+    await db.rl_events.insert_one(
+        {
+            "user_id": user_id,
+            "event_type": "feedback",
+            "action_id": latest_recommendation.get("action_id"),
+            "reward": float(round(reward, 4)),
+            "note": "auto_outcome_reward",
+            "created_at": now,
+        }
+    )
+
+
 def section_label_for(bucket, major, extra_major=False):
     if bucket == GENED_LABEL:
         return "General Education"
@@ -266,13 +338,14 @@ async def start_exam(
 
     query = {"exam_type": exam_type}
     subject_filter = build_subject_filter(profile, subjects)
-    if exam_type != "LET" and subject_filter:
-        query["subject"] = {"$in": subject_filter}
-
     question_list = await db.questions.find(query).to_list(length=None)
-    # Fallback: if subject filter yields nothing, allow all questions for the exam type.
-    if subjects and len(question_list) == 0:
-        question_list = await db.questions.find({"exam_type": exam_type}).to_list(length=None)
+    if exam_type != "LET" and subject_filter:
+        filtered = []
+        for question in question_list:
+            question_subject = (question.get("subject") or "").strip()
+            if any(labels_equivalent(question_subject, allowed) for allowed in subject_filter):
+                filtered.append(question)
+        question_list = filtered or question_list
 
     settings = await db.app_settings.find_one({})
     base_total = settings["exam_question_count"] if settings else 50
@@ -485,6 +558,14 @@ async def submit_exam(
         "created_at": datetime.utcnow()
     }
     result_insert = await db.exam_results.insert_one(exam_result_data)
+    await _apply_auto_recommendation_reward(
+        db=db,
+        user_id=str(user["_id"]),
+        exam_type=profile["target_licensure"],
+        percentage=percentage,
+        result=result,
+        passing_threshold=passing_threshold,
+    )
     await log_event_async(db, str(user["_id"]), "exam_submit", f"Score {score}/{total} ({percentage}%)")
 
     return {
