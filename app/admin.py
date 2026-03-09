@@ -44,11 +44,22 @@ def _safe_timestamp() -> str:
 
 
 def _find_mongo_tool(tool: str) -> str:
+    env_key = f"{tool.upper()}_PATH"
+    env_path = os.getenv(env_key)
+    if env_path and Path(env_path).exists():
+        return env_path
+
     direct = shutil.which(tool)
     if direct:
         return direct
 
     candidates = []
+    # Common Linux locations (Railway, Docker, etc.)
+    for base in ("/usr/local/bin", "/usr/bin", "/bin"):
+        candidate = Path(base) / tool
+        if candidate.exists():
+            candidates.append(candidate)
+
     tools_root = Path("C:/Program Files/MongoDB/Tools")
     if tools_root.exists():
         candidates.extend(tools_root.glob(f"*/bin/{tool}.exe"))
