@@ -1063,6 +1063,10 @@ async def restore_database(
             if matches:
                 candidate_db_dir = matches[0]
         if not candidate_db_dir.exists():
+            root_dump_files = list(extract_root.glob("*.bson"))
+            if root_dump_files:
+                candidate_db_dir = extract_root
+        if not candidate_db_dir.exists():
             raise HTTPException(status_code=400, detail=f"Database folder '{db_name}' not found in backup")
 
         mongorestore = _find_mongo_tool("mongorestore")
