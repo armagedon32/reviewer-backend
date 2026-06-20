@@ -1,35 +1,87 @@
-import csv
-import logging
-import math
 import os
+import pickle
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 
 from .auth import get_current_user
 from .database import get_database
-from .db_models import StudentProfile
 
 router = APIRouter(prefix="/readiness", tags=["Readiness"])
 
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+MODEL_VERSION = "3.0-random-forest"
 
-logger = logging.getLogger(__name__)
+_let_model = None
+_cpa_model = None
 
 
-class ReadinessResponse(BaseModel):
-    score: float
-    range_low: float
-    range_high: float
-    confidence: str
-    recommendation: str
-    predicted_let_score: Optional[float] = None
-    model_version: str = "1.0-csv-heuristic"
-    generated_at: str
-    source: str = "backend"
-    meta: Dict[str, Any] = {}
+def ensure_models_exist():
+    import csv
+    import numpy as np
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import LabelEncoder
+
+    let_path = os.path.join(MODEL_DIR, "let_model.pkl")
+    cpa_path = os.path.join(MODEL_DIR, "cpa_model.pkl")
+
+    if os.path.exists(let_path) and os.path.exists(cpa_path):
+        return
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    repo_root = os.path.join(os.path.dirname(__file__), "..", "..")
+
+    def safe_float(v):
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    def train_model(csv_path, subject_cols, feature_count):
+        if not os.path.exists(csv_path):
+            return None
+        with open(csv_path, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+
+        features, targets = [], []
+        for r in rows:
+            scores = [safe_float(r.get(c)) for c in subject_cols]
+            mocks = [safe_float(r.get(f'Mock_Exam_{i}')) for i in range(1, 11)]
+            att = safe_float(r.get('Attendance_Percent'))
+            study = safe_float(r.get('Study_Hours_Per_Week'))
+            if None in scores or None in mocks or att is None or study is None:
+                continue
+            feats = scores + mocks + [att, study]
+            if len(feats) != feature_count:
+                feats = (feats + [70.0] * feature_count)[:feature_count]
+            features.append(feats)
+            targets.append(r.get('Risk_Level'))
+
+        if len(features) < 3:
+            return None
+
+        X = np.array(features)
+        y = np.array(targets)
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y)
+        model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
+        model.fit(X, y_enc)
+        return {'model': model, 'encoder': le}
+
+    let_artifacts = train_model(os.path.join(repo_root, "student_data.csv"), ['General_Education', 'Professional_Education', 'Major_Subject'], 15)
+    if let_artifacts:
+        with open(let_path, 'wb') as f:
+            pickle.dump(let_artifacts, f)
+        print(f"[readiness] LET model trained ({len(let_artifacts['model'].estimators_)} trees)")
+
+    cpa_artifacts = train_model(os.path.join(repo_root, "student_data_cpa.csv"), ['FAR', 'AFAR', 'AUD', 'MAS', 'RFBT', 'TAX'], 18)
+    if cpa_artifacts:
+        with open(cpa_path, 'wb') as f:
+            pickle.dump(cpa_artifacts, f)
+        print(f"[readiness] CPA model trained ({len(cpa_artifacts['model'].estimators_)} trees)")
 
 
 def _safe_float(value: Any, fallback: float = 0.0) -> float:
@@ -39,93 +91,107 @@ def _safe_float(value: Any, fallback: float = 0.0) -> float:
         return fallback
 
 
-def _get_candidates() -> list:
-    candidates_csv = os.getenv("READINESS_CSV")
-    if candidates_csv and Path(candidates_csv).exists():
-        return [Path(candidates_csv)]
+def _load_model(licensure: str):
+    global _let_model, _cpa_model
 
-    repo_root = Path(__file__).resolve().parents[2]
-    default_csv = repo_root / "models" / "readiness_candidates.csv"
-    if default_csv.exists():
-        return [default_csv]
-
-    return []
-
-
-def _read_candidates(path: Path) -> list:
-    with open(path, "r", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
-def _row_matches_profile(row: Dict[str, str], profile: Optional[StudentProfile]) -> bool:
-    if profile is None:
-        return False
-
-    row_type = str(row.get("type") or row.get("track") or "").strip().upper()
-    profile_target = str(profile.target_licensure or "").strip().upper()
-
-    if profile_target and row_type and row_type != profile_target:
-        return False
-
-    return True
+    key = licensure.upper()
+    if key == "CPA":
+        if _cpa_model is None:
+            path = os.path.join(MODEL_DIR, "cpa_model.pkl")
+            with open(path, "rb") as f:
+                _cpa_model = pickle.load(f)
+        return _cpa_model
+    else:
+        if _let_model is None:
+            path = os.path.join(MODEL_DIR, "let_model.pkl")
+            with open(path, "rb") as f:
+                _let_model = pickle.load(f)
+        return _let_model
 
 
-def _pick_candidate(exam_history: list, profile: Optional[StudentProfile]) -> Optional[Dict[str, str]]:
-    candidates = _get_candidates()
-    for path in candidates:
-        try:
-            rows = _read_candidates(path)
-        except Exception as exc:
-            logger.warning("readiness candidates read failed for %s: %s", path, exc)
-            continue
+def _extract_features_let(exam_results: List[Dict]) -> Optional[List[float]]:
+    if not exam_results:
+        return None
 
-        qualified = []
+    scores = [_safe_float(r.get("percentage", 0), 0.0) for r in exam_results]
+    latest = exam_results[-1]
+    subject_perf = latest.get("subject_performance", {}) or {}
 
-        for row in rows:
-            try:
-                threshold = float(row["threshold"])
-            except Exception:
-                continue
+    ge = 70.0
+    pe = 70.0
+    ms = 70.0
 
-            if _row_matches_profile(row, profile):
-                qualified.append((threshold, row, path.name))
+    label_map = {
+        "general education": "ge",
+        "gened": "ge",
+        "general": "ge",
+        "professional education": "pe",
+        "profed": "pe",
+        "professional": "pe",
+        "major": "ms",
+        "specialization": "ms",
+    }
 
-        if not qualified:
-            continue
+    for subj, stat in subject_perf.items():
+        key = str(subj).strip().lower()
+        role = label_map.get(key)
+        if role == "ge":
+            ge = (stat.get("correct", 0) / max(stat.get("total", 1), 1)) * 100
+        elif role == "pe":
+            pe = (stat.get("correct", 0) / max(stat.get("total", 1), 1)) * 100
+        elif role == "ms":
+            ms = (stat.get("correct", 0) / max(stat.get("total", 1), 1)) * 100
 
-        latest_score = max((_safe_float(entry.get("percentage", 0), 0.0) for entry in exam_history), default=0.0)
+    mocks = scores[:10] if len(scores) >= 10 else scores + [70.0] * (10 - len(scores))
+    attendance = 80.0
+    study_hours = 15.0
 
-        best = None
-        best_delta = None
-        for threshold, row, source in qualified:
-            delta = abs(latest_score - threshold)
-            if best is None or delta < best_delta:
-                best = (threshold, row, source)
-                best_delta = delta
-
-        if best is not None:
-            return {
-                "threshold": best[0],
-                "row": best[1],
-                "source": best[2],
-            }
-
-    return None
+    return [ge, pe, ms] + mocks + [attendance, study_hours]
 
 
-def _confidence_from_history(exam_history: list) -> str:
-    if not exam_history:
-        return "low"
-    if len(exam_history) >= 5:
-        return "high"
-    return "medium"
+def _extract_features_cpa(exam_results: List[Dict]) -> Optional[List[float]]:
+    if not exam_results:
+        return None
+
+    latest = exam_results[-1]
+    scores = [_safe_float(r.get("percentage", 0), 0.0) for r in exam_results]
+    subject_perf = latest.get("subject_performance", {}) or {}
+
+    cpa_subjects = ["FAR", "AFAR", "AUD", "MAS", "RFBT", "TAX"]
+    subject_scores: List[float] = []
+
+    for subj in cpa_subjects:
+        stat = subject_perf.get(subj, {})
+        if stat and stat.get("total", 0) > 0:
+            subject_scores.append((stat.get("correct", 0) / stat["total"]) * 100)
+        else:
+            subject_scores.append(70.0)
+
+    mocks = scores[:10] if len(scores) >= 10 else scores + [70.0] * (10 - len(scores))
+    attendance = 85.0
+    study_hours = 18.0
+
+    return subject_scores + mocks + [attendance, study_hours]
 
 
-@router.get("/prediction", response_model=ReadinessResponse)
+def _predict_risk(model_data: Dict[str, Any], features: List[float]):
+    model = model_data["model"]
+    encoder = model_data["encoder"]
+
+    prediction = model.predict([features])[0]
+    probabilities = model.predict_proba([features])[0]
+
+    risk = encoder.inverse_transform([prediction])[0]
+    confidence = float(max(probabilities))
+
+    return risk, confidence
+
+
+@router.get("/prediction")
 async def get_predicted_readiness(
     current_user=Depends(get_current_user),
     db=Depends(get_database),
-) -> ReadinessResponse:
+):
     user = await db.users.find_one({"email": current_user["email"]})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -134,72 +200,82 @@ async def get_predicted_readiness(
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    exam_history = (
+    target_licensure = profile.get("target_licensure", "LET")
+
+    exam_results = (
         await db.exam_results.find({"user_id": str(user["_id"])})
-        .sort("created_at", -1)
+        .sort("created_at", 1)
         .to_list(length=None)
     )
 
-    candidate = _pick_candidate(exam_history, profile)
+    if not exam_results:
+        return {
+            "readiness_low": 0,
+            "readiness_high": 0,
+            "latest_score": 0,
+            "risk_level": "High",
+            "result": "Fail",
+            "confidence": 0.0,
+            "attempts": 0,
+            "model_version": MODEL_VERSION,
+            "methodology": "No exam data available for prediction.",
+        }
 
-    if candidate is None:
-        return ReadinessResponse(
-            score=0.0,
-            range_low=0.0,
-            range_high=0.0,
-            confidence="low",
-            recommendation="No matching readiness model found. Ensure candidates CSV is deployed.",
-            predicted_let_score=None,
-            meta={"candidates_checked": _get_candidates()},
-            generated_at=datetime.utcnow().isoformat(),
-        )
+    model_data = _load_model(target_licensure)
 
-    threshold = float(candidate["threshold"])
-    row = candidate["row"]
-    source = candidate["source"]
+    if target_licensure.upper() == "CPA":
+        features = _extract_features_cpa(exam_results)
+    else:
+        features = _extract_features_let(exam_results)
 
-    scores = [_safe_float(entry.get("percentage", 0), 0.0) for entry in exam_history]
-    raw_score = max(scores, default=0.0)
-    predicted = max(0.0, min(100.0, raw_score - threshold))
-    predicted_let_score = round(predicted, 2)
+    if features is None:
+        return {
+            "readiness_low": 0,
+            "readiness_high": 0,
+            "latest_score": 0,
+            "risk_level": "High",
+            "result": "Fail",
+            "confidence": 0.0,
+            "attempts": len(exam_results),
+            "model_version": MODEL_VERSION,
+            "methodology": "Insufficient data for feature extraction.",
+        }
 
-    range_low = max(0.0, predicted_let_score - 5.0)
-    range_high = min(100.0, predicted_let_score + 5.0)
+    risk, confidence = _predict_risk(model_data, features)
+    result = "Pass" if risk in ("Low", "Medium") else "Fail"
 
-    stability = row.get("stability", "")
-    stability_factor = {
-        "low": 6.0,
-        "medium": 4.0,
-        "high": 2.0,
-    }.get(str(stability).strip().lower(), 4.0)
+    scores = [_safe_float(r.get("percentage", 0), 0.0) for r in exam_results]
+    latest_score = scores[-1]
+    base_scores = {"Low": 85, "Medium": 78, "High": 65}
+    estimated_rating = base_scores.get(risk, 65)
 
-    range_low = max(0.0, round(predicted_let_score - stability_factor, 2))
-    range_high = min(100.0, round(predicted_let_score + stability_factor, 2))
+    if len(scores) >= 2:
+        trend = scores[-1] - scores[0]
+        estimated_rating += trend * 0.3
 
-    confidence = _confidence_from_history(exam_history)
-    recommendation = row.get("recommendation", "Continue reviewing and retake when ready.")
-    predicted_let_score = round(_safe_float(predicted_let_score), 2)
+    estimated_rating = max(50, min(100, estimated_rating))
 
-    read_desc = row.get("readiness_description", "").strip()
-    notes = []
-    if read_desc:
-        notes.append(read_desc)
-    if row.get("notes"):
-        notes.append(row["notes"])
-    meta = {
-        "readiness_description": read_desc,
-        "notes": row.get("notes"),
-        "threshold": threshold,
+    subject_perf = exam_results[-1].get("subject_performance", {}) or {}
+    weak_subjects: List[str] = []
+    for subj, stat in subject_perf.items():
+        pct = (stat.get("correct", 0) / max(stat.get("total", 1), 1)) * 100
+        if pct < 60:
+            weak_subjects.append(subj)
+
+    return {
+        "readiness_low": max(50, int(estimated_rating - 10)),
+        "readiness_high": min(100, int(estimated_rating + 10)),
+        "latest_score": round(latest_score, 1),
+        "estimated_rating": round(estimated_rating, 1),
+        "risk_level": risk,
+        "result": result,
+        "confidence": round(confidence, 2),
+        "weak_subjects": weak_subjects[:3],
+        "attempts": len(scores),
+        "model_version": MODEL_VERSION,
+        "methodology": (
+            "Random Forest classifier trained on historical student records. "
+            "Model predicts risk level (Low/Medium/High) based on feature patterns learned from training data. "
+            f"Current confidence: {confidence:.0%}. Predicted risk: {risk} → {result}."
+        ),
     }
-
-    return ReadinessResponse(
-        score=predicted_let_score,
-        range_low=range_low,
-        range_high=range_high,
-        confidence=confidence,
-        recommendation=recommendation,
-        predicted_let_score=predicted_let_score,
-        meta=meta,
-        generated_at=datetime.utcnow().isoformat(),
-        source=f"csv:{source}",
-    )

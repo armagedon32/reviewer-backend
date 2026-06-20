@@ -39,6 +39,11 @@ async def on_startup():
     await seed_questions(db)
     await get_or_create_settings(db)
     await ensure_admin_user(db)
+    try:
+        from .readiness import ensure_models_exist
+        ensure_models_exist()
+    except Exception as exc:
+        print(f"[readiness] Model auto-generation skipped: {exc}")
 
 
 app.include_router(auth_router)
