@@ -22,8 +22,6 @@ def get_cors_origins():
     return ["http://localhost:5173"]
 
 
-
-
 app = FastAPI(title="Reviewer Platform API")
 
 app.add_middleware(

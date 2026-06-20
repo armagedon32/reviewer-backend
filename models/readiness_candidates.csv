@@ -1,0 +1,9 @@
+threshold,type,track,stability,recommendation,notes,readiness_description
+80.4,LET,,medium,"You are performing well. Maintain current study habits and review weak areas.","Low risk based on current performance trajectory.","Strong performance trajectory suggests readiness for certification."
+79.8,LET,,medium,"Continue focused review to maintain momentum. Target hardest remaining topics.","Medium-high threshold. Solid performance with room for improvement.","Steady improvement pattern detected. Keep current pace."
+75.0,LET,,medium,"Increase study intensity. Focus on weakest subjects: General Education, Professional Education.","Medium threshold. Improvement needed to reach passing confidence.","Developing pattern. Requires additional structured review."
+81.0,CPA,,medium,"Continue structured review across all CPA sections. Maintain current study schedule.","Medium-high threshold for CPA. Subject averages are passing.","Steady improvement across FAR, AUD, TAX sections."
+85.0,CPA,,medium,"Maintain current performance across all six CPA subjects. Continue mock exams.","Low risk threshold for CPA. Strong subject averages.","Strong performance across all CPA domains."
+70.0,CPA,,low,"Remedial review required. Focus on weakest CPA subjects. Daily structured study needed.","Below CPA passing threshold. Significant intervention required.","High risk pattern. Early-stage learning with intervention needed."
+74.6,LET,,low,"Remedial review required. Focus on weakest subjects. Daily structured study needed.","Below LET passing threshold. Significant intervention required.","High risk pattern. Early-stage learning with intervention needed."
+60.0,LET,,low,"Immediate remediation needed. Enroll in review program. Focus on General Education fundamentals.","Critical threshold. High probability of failure without intervention.","Struggling pattern. Fundamental gaps in core subjects."
