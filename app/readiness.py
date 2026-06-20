@@ -19,9 +19,7 @@ _cpa_model = None
 
 def ensure_models_exist():
     import csv
-    import numpy as np
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.preprocessing import LabelEncoder
+    import os
 
     let_path = os.path.join(MODEL_DIR, "let_model.pkl")
     cpa_path = os.path.join(MODEL_DIR, "cpa_model.pkl")
@@ -61,6 +59,14 @@ def ensure_models_exist():
             targets.append(r.get('Risk_Level'))
 
         if len(features) < 3:
+            return None
+
+        try:
+            import numpy as np
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.preprocessing import LabelEncoder
+        except ImportError:
+            print("[readiness] scikit-learn/numpy not installed. Cannot train models.")
             return None
 
         X = np.array(features)
