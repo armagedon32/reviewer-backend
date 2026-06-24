@@ -320,7 +320,7 @@ async def _student_cert_snapshot(db, user: dict, settings: dict) -> dict:
 
 @router.get("/settings")
 async def get_settings(current_user=Depends(get_current_user), db = Depends(get_database)):
-    if current_user["role"] != "admin":
+    if current_user["role"] not in {"admin", "instructor"}:
         raise HTTPException(status_code=403, detail="Not authorized")
     settings = await get_or_create_settings(db)
     return {
@@ -361,7 +361,7 @@ async def update_settings(
     current_user=Depends(get_current_user),
     db = Depends(get_database),
 ):
-    if current_user["role"] != "admin":
+    if current_user["role"] not in {"admin", "instructor"}:
         raise HTTPException(status_code=403, detail="Not authorized")
     total_questions = await db.questions.count_documents({})
     if payload.exam_question_count > total_questions:
