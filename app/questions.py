@@ -355,13 +355,29 @@ async def seed_questions(db):
 
 @router.get("")
 async def list_questions(
+    exam_type: Optional[str] = None,
     current_user=Depends(get_current_user),
     db = Depends(get_database),
 ):
     if current_user["role"] not in {"instructor", "admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
-    questions = await db.questions.find().to_list(length=None)
+    query = {}
+    if exam_type:
+        query["exam_type"] = exam_type.strip()
+    questions = await db.questions.find(query).to_list(length=None)
     return [question_to_dict(q) for q in questions]
+
+
+@router.get("/summary")
+async def question_summary(
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] not in {"instructor", "admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    let_count = await db.questions.count_documents({"exam_type": "LET"})
+    cpa_count = await db.questions.count_documents({"exam_type": "CPA"})
+    return {"LET": let_count, "CPA": cpa_count}
 
 
 @router.post("")
