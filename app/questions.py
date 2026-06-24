@@ -509,8 +509,8 @@ async def upload_questions_csv(
     if current_user["role"] not in {"instructor", "admin"}:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    if not file.filename.lower().endswith((".csv", ".txt")):
-        raise HTTPException(status_code=400, detail="Only CSV or TXT files are supported")
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported")
 
     content = await file.read()
     try:
