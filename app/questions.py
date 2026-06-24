@@ -559,11 +559,17 @@ async def upload_questions_csv(
     added = 0
     skipped = 0
     question_idx = headers.index("question") if "question" in headers else None
+    errors = []
+
+    def _skip(reason: str):
+        nonlocal skipped
+        skipped += 1
+        errors.append({"row": raw_reader.line_num, "reason": reason})
 
     for row in raw_reader:
         if not row or all(not str(cell).strip() for cell in row):
             continue
-        # If unquoted commas caused extra columns, merge extras back into the question field.
+        row_num = raw_reader.line_num
         if question_idx is not None and len(row) > len(headers):
             extra = len(row) - len(headers)
             merged_question = ",".join(row[question_idx : question_idx + extra + 1])
@@ -572,14 +578,27 @@ async def upload_questions_csv(
                 + [merged_question]
                 + row[question_idx + extra + 1 :]
             )
-        # Pad missing columns
         if len(row) < len(headers):
             row = row + [""] * (len(headers) - len(row))
 
         row_dict = dict(zip(headers, row))
         mapped = map_csv_row(row_dict)
         if is_invalid_question(mapped):
-            skipped += 1
+            missing = [
+                f
+                for f in ["exam_type", "subject", "topic", "difficulty", "question", "a", "b", "c", "d", "answer"]
+                if not (mapped.get(f) or "").strip()
+            ]
+            if missing:
+                _skip(f"Row {row_num}: missing field(s) — {', '.join(missing)}")
+            elif mapped.get("difficulty") not in {"Easy", "Medium", "Hard"}:
+                _skip(f"Row {row_num}: invalid difficulty '{mapped.get('difficulty')}' (use Easy, Medium, Hard)")
+            elif mapped.get("answer") not in {"A", "B", "C", "D"}:
+                _skip(f"Row {row_num}: invalid answer '{mapped.get('answer')}' (use A, B, C, or D)")
+            elif has_embedded_options(mapped.get("question", "")):
+                _skip(f"Row {row_num}: question text contains embedded options (A/B/C/D)")
+            else:
+                _skip(f"Row {row_num}: invalid or incomplete data")
             continue
         mapped["question_key"] = build_question_key(mapped)
         result = await db.questions.update_one(
@@ -590,4 +609,4 @@ async def upload_questions_csv(
         if result.upserted_id or result.modified_count:
             added += 1
 
-    return {"added": added, "skipped": skipped}
+    return {"added": added, "skipped": skipped, "errors": errors[:20]}
