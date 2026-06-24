@@ -19,7 +19,12 @@ def get_cors_origins():
     origins = os.getenv("CORS_ORIGINS", "")
     if origins:
         return [origin.strip() for origin in origins.split(",") if origin.strip()]
-    return ["http://localhost:5173"]
+    return [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://localhost:4173",
+        "null",
+    ]
 
 
 app = FastAPI(title="Reviewer Platform API")
