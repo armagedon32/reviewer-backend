@@ -22,7 +22,7 @@ router = APIRouter(prefix="/admin", tags=["Admin"])
 
 ACCESS_ACTIONS = ("access_request", "access_approved", "access_denied")
 REQUEST_TTL_SECONDS = 60 * 60
-TEMP_PASSWORD_TTL_MINUTES = 15
+TEMP_PASSWORD_TTL_MINUTES = 1440
 BACKUP_TIMESTAMP_FMT = "%Y%m%d-%H%M%S"
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
