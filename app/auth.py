@@ -27,7 +27,9 @@ async def get_current_user(
         if not email:
             raise HTTPException(status_code=401, detail="Invalid token")
         user = await db.users.find_one({"email": email})
-        if not user or not user.get("active", True):
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        if not user.get("active", True) and role not in {"admin", "instructor"}:
             raise HTTPException(status_code=403, detail="User is inactive")
         if user.get("must_change_password", False):
             raise HTTPException(status_code=403, detail="Password reset required")
@@ -69,7 +71,9 @@ async def get_current_user_allow_password_reset(
         if not email:
             raise HTTPException(status_code=401, detail="Invalid token")
         user = await db.users.find_one({"email": email})
-        if not user or not user.get("active", True):
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        if not user.get("active", True) and role not in {"admin", "instructor"}:
             raise HTTPException(status_code=403, detail="User is inactive")
         return {"email": email, "role": role}
     except HTTPException:
@@ -103,6 +107,10 @@ async def ensure_admin_user(db):
     admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
     admin_exists = await db.users.find_one({"role": "admin"})
     if admin_exists:
+        await db.users.update_one(
+            {"_id": admin_exists["_id"]},
+            {"$set": {"active": True, "must_change_password": False}},
+        )
         return
     user_data = {
         "email": admin_email,
@@ -127,7 +135,7 @@ async def login(data: LoginRequest, db = Depends(get_database)):
 
     if not user or not verify_password(data.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not user.get("active", True):
+    if not user.get("active", True) and user.get("role") not in {"admin", "instructor"}:
         raise HTTPException(status_code=403, detail="User is inactive")
     if user.get("must_change_password", False) and user.get("temp_password_expires_at"):
         if datetime.utcnow() > user["temp_password_expires_at"]:
