@@ -26,6 +26,7 @@ def get_cors_origins():
         "null",
         "https://reviewer-ui.netlify.app",
         "https://reviewer-backend-production.up.railway.app",
+        "https://reviewer-ui-production.up.railway.app",
     ]
 
 
