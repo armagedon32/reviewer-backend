@@ -297,6 +297,9 @@ async def get_predicted_readiness(
     if len(scores) >= 2:
         trend = scores[-1] - scores[0]
         estimated_rating += trend * 0.3
+        trend = round(trend, 1)
+    else:
+        trend = 0
 
     estimated_rating = max(50, min(100, estimated_rating))
 
@@ -312,6 +315,7 @@ async def get_predicted_readiness(
         "readiness_high": min(100, int(estimated_rating + 10)),
         "latest_score": round(latest_score, 1),
         "estimated_rating": round(estimated_rating, 1),
+        "trend": trend,
         "risk_level": risk,
         "result": result,
         "confidence": round(confidence, 2),
