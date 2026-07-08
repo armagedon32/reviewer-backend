@@ -24,6 +24,8 @@ def get_cors_origins():
         "http://localhost:3000",
         "http://localhost:4173",
         "null",
+        "https://reviewer-ui.netlify.app",
+        "https://reviewer-backend-production.up.railway.app",
     ]
 
 
