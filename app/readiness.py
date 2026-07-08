@@ -11,9 +11,10 @@ from .database import get_database
 router = APIRouter(prefix="/readiness", tags=["Readiness"])
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-MODEL_VERSION = "3.0-random-forest"
+MODEL_VERSION = "4.0-track-aware"
 
-_let_model = None
+_let_elementary_model = None
+_let_secondary_model = None
 _cpa_model = None
 
 
@@ -21,10 +22,15 @@ def ensure_models_exist():
     import csv
     import os
 
-    let_path = os.path.join(MODEL_DIR, "let_model.pkl")
+    let_elem_path = os.path.join(MODEL_DIR, "let_elementary_model.pkl")
+    let_sec_path = os.path.join(MODEL_DIR, "let_secondary_model.pkl")
     cpa_path = os.path.join(MODEL_DIR, "cpa_model.pkl")
 
-    if os.path.exists(let_path) and os.path.exists(cpa_path):
+    if (
+        os.path.exists(let_elem_path)
+        and os.path.exists(let_sec_path)
+        and os.path.exists(cpa_path)
+    ):
         return
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -38,25 +44,27 @@ def ensure_models_exist():
         except (ValueError, TypeError):
             return None
 
-    def train_model(csv_path, subject_cols, feature_count):
+    def train_model(csv_path, track_filter, subject_cols, feature_count):
         if not os.path.exists(csv_path):
             return None
-        with open(csv_path, newline='', encoding='utf-8') as f:
+        with open(csv_path, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
 
         features, targets = [], []
         for r in rows:
+            if track_filter and r.get("Track", "").strip() != track_filter:
+                continue
             scores = [safe_float(r.get(c)) for c in subject_cols]
-            mocks = [safe_float(r.get(f'Mock_Exam_{i}')) for i in range(1, 11)]
-            att = safe_float(r.get('Attendance_Percent'))
-            study = safe_float(r.get('Study_Hours_Per_Week'))
+            mocks = [safe_float(r.get(f"Mock_Exam_{i}")) for i in range(1, 11)]
+            att = safe_float(r.get("Attendance_Percent"))
+            study = safe_float(r.get("Study_Hours_Per_Week"))
             if None in scores or None in mocks or att is None or study is None:
                 continue
             feats = scores + mocks + [att, study]
             if len(feats) != feature_count:
                 feats = (feats + [70.0] * feature_count)[:feature_count]
             features.append(feats)
-            targets.append(r.get('Risk_Level'))
+            targets.append(r.get("Risk_Level"))
 
         if len(features) < 3:
             return None
@@ -75,19 +83,43 @@ def ensure_models_exist():
         y_enc = le.fit_transform(y)
         model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
         model.fit(X, y_enc)
-        return {'model': model, 'encoder': le}
+        return {"model": model, "encoder": le}
 
-    let_artifacts = train_model(os.path.join(repo_root, "student_data.csv"), ['General_Education', 'Professional_Education', 'Major_Subject'], 15)
-    if let_artifacts:
-        with open(let_path, 'wb') as f:
-            pickle.dump(let_artifacts, f)
-        print(f"[readiness] LET model trained ({len(let_artifacts['model'].estimators_)} trees)")
+    # LET Elementary: GenEd + ProfEd only (no major subject) -> 14 features
+    let_elem = train_model(
+        os.path.join(repo_root, "student_data.csv"),
+        "Elementary",
+        ["General_Education", "Professional_Education"],
+        14,
+    )
+    if let_elem:
+        with open(let_elem_path, "wb") as f:
+            pickle.dump(let_elem, f)
+        print(f"[readiness] LET Elementary model trained ({len(let_elem['model'].estimators_)} trees)")
 
-    cpa_artifacts = train_model(os.path.join(repo_root, "student_data_cpa.csv"), ['FAR', 'AFAR', 'AUD', 'MAS', 'RFBT', 'TAX'], 18)
-    if cpa_artifacts:
-        with open(cpa_path, 'wb') as f:
-            pickle.dump(cpa_artifacts, f)
-        print(f"[readiness] CPA model trained ({len(cpa_artifacts['model'].estimators_)} trees)")
+    # LET Secondary: GenEd + ProfEd + Major -> 15 features
+    let_sec = train_model(
+        os.path.join(repo_root, "student_data.csv"),
+        "Secondary",
+        ["General_Education", "Professional_Education", "Major_Subject"],
+        15,
+    )
+    if let_sec:
+        with open(let_sec_path, "wb") as f:
+            pickle.dump(let_sec, f)
+        print(f"[readiness] LET Secondary model trained ({len(let_sec['model'].estimators_)} trees)")
+
+    # CPA: 6 subjects -> 18 features
+    cpa = train_model(
+        os.path.join(repo_root, "student_data_cpa.csv"),
+        None,
+        ["FAR", "AFAR", "AUD", "MAS", "RFBT", "TAX"],
+        18,
+    )
+    if cpa:
+        with open(cpa_path, "wb") as f:
+            pickle.dump(cpa, f)
+        print(f"[readiness] CPA model trained ({len(cpa['model'].estimators_)} trees)")
 
 
 def _safe_float(value: Any, fallback: float = 0.0) -> float:
@@ -97,22 +129,35 @@ def _safe_float(value: Any, fallback: float = 0.0) -> float:
         return fallback
 
 
-def _load_model(licensure: str):
-    global _let_model, _cpa_model
+def _load_model(licensure: str, track: str = None):
+    global _let_elementary_model, _let_secondary_model, _cpa_model
 
     key = licensure.upper()
     if key == "CPA":
         if _cpa_model is None:
-            path = os.path.join(MODEL_DIR, "cpa_model.pkl")
-            with open(path, "rb") as f:
+            with open(os.path.join(MODEL_DIR, "cpa_model.pkl"), "rb") as f:
                 _cpa_model = pickle.load(f)
         return _cpa_model
+
+    # LET: pick model by track
+    if track == "Elementary":
+        if _let_elementary_model is None:
+            with open(os.path.join(MODEL_DIR, "let_elementary_model.pkl"), "rb") as f:
+                _let_elementary_model = pickle.load(f)
+        return _let_elementary_model
     else:
-        if _let_model is None:
-            path = os.path.join(MODEL_DIR, "let_model.pkl")
-            with open(path, "rb") as f:
-                _let_model = pickle.load(f)
-        return _let_model
+        if _let_secondary_model is None:
+            with open(os.path.join(MODEL_DIR, "let_secondary_model.pkl"), "rb") as f:
+                _let_secondary_model = pickle.load(f)
+        return _let_secondary_model
+
+
+def _detect_let_track(subject_perf: Dict[str, Any]) -> str:
+    for subj in subject_perf:
+        key = str(subj).strip().lower()
+        if "major" in key or "specialization" in key:
+            return "Secondary"
+    return "Elementary"
 
 
 def _extract_features_let(exam_results: List[Dict]) -> Optional[List[float]]:
@@ -152,7 +197,10 @@ def _extract_features_let(exam_results: List[Dict]) -> Optional[List[float]]:
     attendance = 80.0
     study_hours = 15.0
 
-    return [ge, pe, ms] + mocks + [attendance, study_hours]
+    track = _detect_let_track(subject_perf)
+    if track == "Secondary":
+        return [ge, pe, ms] + mocks + [attendance, study_hours]
+    return [ge, pe] + mocks + [attendance, study_hours]
 
 
 def _extract_features_cpa(exam_results: List[Dict]) -> Optional[List[float]]:
@@ -227,12 +275,16 @@ async def get_predicted_readiness(
             "methodology": "No exam data available for prediction.",
         }
 
-    model_data = _load_model(target_licensure)
+    track = None
+    if target_licensure.upper() != "CPA":
+        track = _detect_let_track(exam_results[-1].get("subject_performance", {}) or {})
 
     if target_licensure.upper() == "CPA":
         features = _extract_features_cpa(exam_results)
     else:
         features = _extract_features_let(exam_results)
+
+    model_data = _load_model(target_licensure, track)
 
     if features is None:
         return {
@@ -280,8 +332,8 @@ async def get_predicted_readiness(
         "attempts": len(scores),
         "model_version": MODEL_VERSION,
         "methodology": (
-            "Random Forest classifier trained on historical student records. "
-            "Model predicts risk level (Low/Medium/High) based on feature patterns learned from training data. "
+            "Random Forest classifier (track-aware) trained on historical student records. "
+            "LET Elementary and Secondary use separate models; Elementary excludes the major-subject feature. "
             f"Current confidence: {confidence:.0%}. Predicted risk: {risk} → {result}."
         ),
     }
