@@ -1,5 +1,6 @@
 ﻿from datetime import datetime
 from typing import Optional
+from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 import random
@@ -840,7 +841,6 @@ async def get_class_analytics(
     total_exams = len(all_results)
     passed = sum(1 for r in all_results if r.get("result") == "PASS")
 
-    from collections import defaultdict
     daily = defaultdict(list)
     for r in all_results:
         created = r.get("created_at")
