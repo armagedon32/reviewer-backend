@@ -18,7 +18,7 @@ _let_secondary_model = None
 _cpa_model = None
 
 
-def ensure_models_exist():
+def ensure_models_exist(force=False):
     import csv
     import os
 
@@ -74,7 +74,7 @@ def ensure_models_exist():
         y_enc = le.fit_transform(y)
         model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
         model.fit(X, y_enc)
-        return {"model": model, "encoder": le}
+        return {"model": model, "encoder": le, "rows": len(features)}
 
     # Train each model independently based on its own file existence.
     specs = [
@@ -84,13 +84,40 @@ def ensure_models_exist():
     ]
     for fname, csv_path, track, cols, fcount in specs:
         fpath = os.path.join(MODEL_DIR, fname)
-        if os.path.exists(fpath):
+        if os.path.exists(fpath) and not force:
             continue
         artifacts = train_model(csv_path, track, cols, fcount)
         if artifacts:
             with open(fpath, "wb") as f:
                 pickle.dump(artifacts, f)
-            print(f"[readiness] Trained {fname} ({len(artifacts['model'].estimators_)} trees)")
+            print(f"[readiness] Trained {fname} ({len(artifacts['model'].estimators_)} trees, {artifacts['rows']} rows)")
+
+
+async def save_model_metadata(db):
+    metadata = {
+        "_id": "readiness",
+        "last_retrained": datetime.utcnow(),
+        "model_version": MODEL_VERSION,
+        "models": {},
+    }
+    for fname in ["let_elementary_model.pkl", "let_secondary_model.pkl", "cpa_model.pkl"]:
+        fpath = os.path.join(MODEL_DIR, fname)
+        if os.path.exists(fpath):
+            with open(fpath, "rb") as f:
+                data = pickle.load(f)
+            metadata["models"][fname.replace(".pkl", "")] = {
+                "trees": len(data["model"].estimators_),
+                "classes": data["encoder"].classes_.tolist(),
+                "features": data["model"].n_features_in_,
+                "rows": data.get("rows", 0),
+                "file_size_kb": round(os.path.getsize(fpath) / 1024, 1),
+            }
+    await db.model_metadata.update_one(
+        {"_id": "readiness"},
+        {"$set": metadata},
+        upsert=True,
+    )
+    return metadata
 
 
 def _safe_float(value: Any, fallback: float = 0.0) -> float:
@@ -328,3 +355,41 @@ async def get_predicted_readiness(
             f"Current confidence: {confidence:.0%}. Predicted risk: {risk} → {result}."
         ),
     }
+
+
+@router.get("/models")
+async def get_model_info(
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    metadata = await db.model_metadata.find_one({"_id": "readiness"})
+    if not metadata:
+        return {
+            "message": "No metadata yet — models will train on first prediction request.",
+            "model_version": MODEL_VERSION,
+            "model_files": {
+                "let_elementary_model.pkl": os.path.exists(os.path.join(MODEL_DIR, "let_elementary_model.pkl")),
+                "let_secondary_model.pkl": os.path.exists(os.path.join(MODEL_DIR, "let_secondary_model.pkl")),
+                "cpa_model.pkl": os.path.exists(os.path.join(MODEL_DIR, "cpa_model.pkl")),
+            },
+        }
+    return metadata
+
+
+@router.post("/retrain")
+async def retrain_models(
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can trigger retraining")
+
+    ensure_models_exist(force=True)
+
+    global _let_elementary_model, _let_secondary_model, _cpa_model
+    _let_elementary_model = None
+    _let_secondary_model = None
+    _cpa_model = None
+
+    metadata = await save_model_metadata(db)
+    return {"message": "Models retrained successfully", "metadata": metadata}

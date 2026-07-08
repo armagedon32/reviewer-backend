@@ -8,6 +8,8 @@ from .auth import get_current_user
 from .database import get_database
 from .db_models import AppSetting, ExamResult, Question, StudentProfile, User
 from .audit import log_event_async
+from .readiness import ensure_models_exist, save_model_metadata
+import os
 
 
 router = APIRouter(prefix="/exam", tags=["Exam"])
@@ -567,6 +569,29 @@ async def submit_exam(
         passing_threshold=passing_threshold,
     )
     await log_event_async(db, str(user["_id"]), "exam_submit", f"Score {score}/{total} ({percentage}%)")
+
+    try:
+        counter = await db.app_settings.find_one_and_update(
+            {"_id": "retrain_counter"},
+            {"$inc": {"count": 1}},
+            upsert=True,
+            return_document=True,
+        )
+        count = counter.get("count", 1) if counter else 1
+        if count >= 10:
+            ensure_models_exist(force=True)
+            await save_model_metadata(db)
+            from .readiness import _let_elementary_model, _let_secondary_model, _cpa_model
+            _let_elementary_model = None
+            _let_secondary_model = None
+            _cpa_model = None
+            await db.app_settings.update_one(
+                {"_id": "retrain_counter"},
+                {"$set": {"count": 0}},
+            )
+            print(f"[auto-retrain] Models retrained after {count} new exam submissions.")
+    except Exception as e:
+        print(f"[auto-retrain] Error: {e}")
 
     return {
         "email": email,
