@@ -737,11 +737,11 @@ async def get_exam_history(
     ]
 
 
-@router.get("/class-analytics")
 LET_GENED_LABELS = {"General Education", "GenEd", "General"}
 LET_PROFED_LABELS = {"Professional Education", "ProfEd", "Professional Ed", "Professional"}
 CPA_SUBJECTS = {"FAR", "AFAR", "AUD", "MAS", "RFBT", "TAX"}
 
+@router.get("/class-analytics")
 async def get_class_analytics(
     program: Optional[str] = Query(default=None),
     let_track: Optional[str] = Query(default=None),
