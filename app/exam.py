@@ -736,5 +736,137 @@ async def get_exam_history(
     ]
 
 
+@router.get("/class-analytics")
+async def get_class_analytics(
+    program: Optional[str] = Query(default=None),
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] not in {"instructor", "admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized")
 
+    program_filter = program.strip() if program else None
+    match = {"exam_type": program_filter} if program_filter else {}
 
+    active_users = await db.users.find({"role": "student", "active": True}).to_list(length=None)
+    active_user_ids = [str(u["_id"]) for u in active_users]
+    user_by_id = {str(u["_id"]): u for u in active_users}
+
+    profile_query = {"user_id": {"$in": active_user_ids}}
+    if program_filter:
+        profile_query["target_licensure"] = program_filter
+    profiles = await db.student_profiles.find(profile_query).to_list(length=None)
+    profile_by_user = {p["user_id"]: p for p in profiles}
+    enrolled_ids = [p["user_id"] for p in profiles]
+
+    latest_pipeline = [
+        {"$match": match},
+        {"$sort": {"created_at": -1}},
+        {
+            "$group": {
+                "_id": "$user_id",
+                "latest": {"$first": "$$ROOT"},
+                "total_attempts": {"$sum": 1},
+                "all_scores": {"$push": "$percentage"},
+            }
+        },
+    ]
+    agg_results = await db.exam_results.aggregate(latest_pipeline).to_list(length=None)
+
+    all_results = await db.exam_results.find(match).to_list(length=None)
+
+    subject_stats = {}
+    for r in all_results:
+        perf = r.get("subject_performance", {}) or {}
+        for subj, stat in perf.items():
+            s = subject_stats.setdefault(subj, {
+                "total_correct": 0, "total_questions": 0,
+                "students_below_60": set(), "appearances": 0,
+            })
+            s["total_correct"] += stat.get("correct", 0)
+            s["total_questions"] += stat.get("total", 0)
+            s["appearances"] += 1
+            total = stat.get("total", 0)
+            if total > 0 and (stat["correct"] / total) * 100 < 60:
+                s["students_below_60"].add(r.get("user_id"))
+
+    subject_weakness = []
+    for subj, stats in sorted(subject_stats.items(), key=lambda x: (
+        len(x[1]["students_below_60"]), x[1].get("total_correct", 0) / max(x[1].get("total_questions", 1), 1)
+    )):
+        avg = (stats["total_correct"] / stats["total_questions"] * 100) if stats["total_questions"] else 0
+        subject_weakness.append({
+            "subject": subj,
+            "class_avg": round(avg, 1),
+            "students_below_60": len(stats["students_below_60"]),
+            "appearances": stats["appearances"],
+        })
+
+    students = []
+    distribution = {"0-20": 0, "21-40": 0, "41-60": 0, "61-80": 0, "81-100": 0}
+    for entry in agg_results:
+        uid = entry["_id"]
+        if uid not in enrolled_ids:
+            continue
+        latest = entry["latest"]
+        profile = profile_by_user.get(uid, {})
+        user = user_by_id.get(uid, {})
+
+        perf = latest.get("subject_performance", {}) or {}
+        weak = [
+            subj for subj, stat in perf.items()
+            if stat.get("total", 0) > 0 and (stat["correct"] / stat["total"]) * 100 < 60
+        ]
+
+        score = latest.get("percentage", 0)
+        if score <= 20: distribution["0-20"] += 1
+        elif score <= 40: distribution["21-40"] += 1
+        elif score <= 60: distribution["41-60"] += 1
+        elif score <= 80: distribution["61-80"] += 1
+        else: distribution["81-100"] += 1
+
+        track = (profile.get("let_track") or "").strip().lower().capitalize()
+        students.append({
+            "email": user.get("email", "Unknown"),
+            "latest_score": round(score, 1),
+            "latest_result": latest.get("result", ""),
+            "total_attempts": entry["total_attempts"],
+            "weak_subjects": weak[:5],
+            "major": major_label_for_profile(profile),
+            "track": track if track else major_label_for_profile(profile),
+            "target_licensure": profile.get("target_licensure", ""),
+        })
+
+    total_exams = len(all_results)
+    passed = sum(1 for r in all_results if r.get("result") == "PASS")
+
+    from collections import defaultdict
+    daily = defaultdict(list)
+    for r in all_results:
+        created = r.get("created_at")
+        if created:
+            day = created.strftime("%Y-%m-%d")
+            daily[day].append(r.get("percentage", 0) or 0)
+    trend = sorted([
+        {"date": day, "avg_score": round(sum(scores) / len(scores), 1)}
+        for day, scores in daily.items()
+    ])[-14:]
+
+    avg_latest = (
+        round(sum(s["latest_score"] for s in students) / len(students), 1)
+        if students else 0
+    )
+
+    return {
+        "summary": {
+            "avg_score": avg_latest,
+            "pass_rate": round(passed / total_exams * 100, 1) if total_exams else 0,
+            "active_students": len(enrolled_ids),
+            "students_with_exams": len(students),
+            "total_attempts": total_exams,
+        },
+        "subject_weakness": subject_weakness[:20],
+        "students": sorted(students, key=lambda s: s["latest_score"]),
+        "score_distribution": distribution,
+        "trend": trend,
+    }
