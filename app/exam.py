@@ -738,8 +738,13 @@ async def get_exam_history(
 
 
 @router.get("/class-analytics")
+LET_GENED_LABELS = {"General Education", "GenEd", "General"}
+LET_PROFED_LABELS = {"Professional Education", "ProfEd", "Professional Ed", "Professional"}
+CPA_SUBJECTS = {"FAR", "AFAR", "AUD", "MAS", "RFBT", "TAX"}
+
 async def get_class_analytics(
     program: Optional[str] = Query(default=None),
+    let_track: Optional[str] = Query(default=None),
     current_user=Depends(get_current_user),
     db = Depends(get_database),
 ):
@@ -856,6 +861,37 @@ async def get_class_analytics(
         round(sum(s["latest_score"] for s in students) / len(students), 1)
         if students else 0
     )
+
+    # Filter subjects by instructor's program/track
+    if program_filter and program_filter.upper() == "CPA":
+        subject_weakness = [sw for sw in subject_weakness if sw["subject"] in CPA_SUBJECTS]
+        for s in students:
+            s["weak_subjects"] = [ws for ws in s["weak_subjects"] if ws in CPA_SUBJECTS]
+    elif program_filter and program_filter.upper() == "LET" and let_track:
+        track = let_track.strip().lower().capitalize()
+        if track == "Elementary":
+            subject_weakness = [
+                sw for sw in subject_weakness
+                if sw["subject"].strip().lower() in {x.lower() for x in LET_GENED_LABELS | LET_PROFED_LABELS}
+            ]
+            for s in students:
+                s["weak_subjects"] = [
+                    ws for ws in s["weak_subjects"]
+                    if ws.strip().lower() in {x.lower() for x in LET_GENED_LABELS | LET_PROFED_LABELS}
+                ]
+        elif track == "Secondary":
+            core_lower = {x.lower() for x in LET_GENED_LABELS | LET_PROFED_LABELS}
+            subject_weakness = [
+                sw for sw in subject_weakness
+                if sw["subject"].strip().lower() in core_lower
+                or sw["subject"].strip().lower() not in {x.lower() for x in CPA_SUBJECTS}
+            ]
+            for s in students:
+                s["weak_subjects"] = [
+                    ws for ws in s["weak_subjects"]
+                    if ws.strip().lower() in core_lower
+                    or ws.strip().lower() not in {x.lower() for x in CPA_SUBJECTS}
+                ]
 
     return {
         "summary": {
