@@ -22,19 +22,8 @@ def ensure_models_exist():
     import csv
     import os
 
-    let_elem_path = os.path.join(MODEL_DIR, "let_elementary_model.pkl")
-    let_sec_path = os.path.join(MODEL_DIR, "let_secondary_model.pkl")
-    cpa_path = os.path.join(MODEL_DIR, "cpa_model.pkl")
-
-    if (
-        os.path.exists(let_elem_path)
-        and os.path.exists(let_sec_path)
-        and os.path.exists(cpa_path)
-    ):
-        return
-
     os.makedirs(MODEL_DIR, exist_ok=True)
-    repo_root = os.path.join(os.path.dirname(__file__), "..", "..")
+    repo_root = os.path.join(os.path.dirname(__file__), "..")
 
     def safe_float(v):
         if v is None:
@@ -46,6 +35,7 @@ def ensure_models_exist():
 
     def train_model(csv_path, track_filter, subject_cols, feature_count):
         if not os.path.exists(csv_path):
+            print(f"[readiness] Training data not found: {csv_path}")
             return None
         with open(csv_path, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
@@ -67,6 +57,7 @@ def ensure_models_exist():
             targets.append(r.get("Risk_Level"))
 
         if len(features) < 3:
+            print(f"[readiness] Not enough training rows for {csv_path} (track={track_filter})")
             return None
 
         try:
@@ -85,41 +76,21 @@ def ensure_models_exist():
         model.fit(X, y_enc)
         return {"model": model, "encoder": le}
 
-    # LET Elementary: GenEd + ProfEd only (no major subject) -> 14 features
-    let_elem = train_model(
-        os.path.join(repo_root, "student_data.csv"),
-        "Elementary",
-        ["General_Education", "Professional_Education"],
-        14,
-    )
-    if let_elem:
-        with open(let_elem_path, "wb") as f:
-            pickle.dump(let_elem, f)
-        print(f"[readiness] LET Elementary model trained ({len(let_elem['model'].estimators_)} trees)")
-
-    # LET Secondary: GenEd + ProfEd + Major -> 15 features
-    let_sec = train_model(
-        os.path.join(repo_root, "student_data.csv"),
-        "Secondary",
-        ["General_Education", "Professional_Education", "Major_Subject"],
-        15,
-    )
-    if let_sec:
-        with open(let_sec_path, "wb") as f:
-            pickle.dump(let_sec, f)
-        print(f"[readiness] LET Secondary model trained ({len(let_sec['model'].estimators_)} trees)")
-
-    # CPA: 6 subjects -> 18 features
-    cpa = train_model(
-        os.path.join(repo_root, "student_data_cpa.csv"),
-        None,
-        ["FAR", "AFAR", "AUD", "MAS", "RFBT", "TAX"],
-        18,
-    )
-    if cpa:
-        with open(cpa_path, "wb") as f:
-            pickle.dump(cpa, f)
-        print(f"[readiness] CPA model trained ({len(cpa['model'].estimators_)} trees)")
+    # Train each model independently based on its own file existence.
+    specs = [
+        ("let_elementary_model.pkl", os.path.join(repo_root, "student_data.csv"), "Elementary", ["General_Education", "Professional_Education"], 14),
+        ("let_secondary_model.pkl", os.path.join(repo_root, "student_data.csv"), "Secondary", ["General_Education", "Professional_Education", "Major_Subject"], 15),
+        ("cpa_model.pkl", os.path.join(repo_root, "student_data_cpa.csv"), None, ["FAR", "AFAR", "AUD", "MAS", "RFBT", "TAX"], 18),
+    ]
+    for fname, csv_path, track, cols, fcount in specs:
+        fpath = os.path.join(MODEL_DIR, fname)
+        if os.path.exists(fpath):
+            continue
+        artifacts = train_model(csv_path, track, cols, fcount)
+        if artifacts:
+            with open(fpath, "wb") as f:
+                pickle.dump(artifacts, f)
+            print(f"[readiness] Trained {fname} ({len(artifacts['model'].estimators_)} trees)")
 
 
 def _safe_float(value: Any, fallback: float = 0.0) -> float:
@@ -134,33 +105,37 @@ def _load_model(licensure: str, track: str = None):
 
     key = licensure.upper()
     if key == "CPA":
+        path = os.path.join(MODEL_DIR, "cpa_model.pkl")
         if _cpa_model is None:
-            with open(os.path.join(MODEL_DIR, "cpa_model.pkl"), "rb") as f:
-                _cpa_model = pickle.load(f)
+            if not os.path.exists(path):
+                ensure_models_exist()
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    _cpa_model = pickle.load(f)
         return _cpa_model
 
     # LET: pick model by track
     if track == "Elementary":
+        path = os.path.join(MODEL_DIR, "let_elementary_model.pkl")
         if _let_elementary_model is None:
-            with open(os.path.join(MODEL_DIR, "let_elementary_model.pkl"), "rb") as f:
-                _let_elementary_model = pickle.load(f)
+            if not os.path.exists(path):
+                ensure_models_exist()
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    _let_elementary_model = pickle.load(f)
         return _let_elementary_model
     else:
+        path = os.path.join(MODEL_DIR, "let_secondary_model.pkl")
         if _let_secondary_model is None:
-            with open(os.path.join(MODEL_DIR, "let_secondary_model.pkl"), "rb") as f:
-                _let_secondary_model = pickle.load(f)
+            if not os.path.exists(path):
+                ensure_models_exist()
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    _let_secondary_model = pickle.load(f)
         return _let_secondary_model
 
 
-def _detect_let_track(subject_perf: Dict[str, Any]) -> str:
-    for subj in subject_perf:
-        key = str(subj).strip().lower()
-        if "major" in key or "specialization" in key:
-            return "Secondary"
-    return "Elementary"
-
-
-def _extract_features_let(exam_results: List[Dict]) -> Optional[List[float]]:
+def _extract_features_let(exam_results: List[Dict], track: str = "Elementary") -> Optional[List[float]]:
     if not exam_results:
         return None
 
@@ -179,8 +154,6 @@ def _extract_features_let(exam_results: List[Dict]) -> Optional[List[float]]:
         "professional education": "pe",
         "profed": "pe",
         "professional": "pe",
-        "major": "ms",
-        "specialization": "ms",
     }
 
     for subj, stat in subject_perf.items():
@@ -190,14 +163,13 @@ def _extract_features_let(exam_results: List[Dict]) -> Optional[List[float]]:
             ge = (stat.get("correct", 0) / max(stat.get("total", 1), 1)) * 100
         elif role == "pe":
             pe = (stat.get("correct", 0) / max(stat.get("total", 1), 1)) * 100
-        elif role == "ms":
+        else:
             ms = (stat.get("correct", 0) / max(stat.get("total", 1), 1)) * 100
 
     mocks = scores[:10] if len(scores) >= 10 else scores + [70.0] * (10 - len(scores))
     attendance = 80.0
     study_hours = 15.0
 
-    track = _detect_let_track(subject_perf)
     if track == "Secondary":
         return [ge, pe, ms] + mocks + [attendance, study_hours]
     return [ge, pe] + mocks + [attendance, study_hours]
@@ -277,14 +249,29 @@ async def get_predicted_readiness(
 
     track = None
     if target_licensure.upper() != "CPA":
-        track = _detect_let_track(exam_results[-1].get("subject_performance", {}) or {})
+        track = (profile.get("let_track") or "Elementary").strip().lower().capitalize()
+        if track not in ("Elementary", "Secondary"):
+            track = "Elementary"
 
     if target_licensure.upper() == "CPA":
         features = _extract_features_cpa(exam_results)
     else:
-        features = _extract_features_let(exam_results)
+        features = _extract_features_let(exam_results, track)
 
     model_data = _load_model(target_licensure, track)
+
+    if model_data is None:
+        return {
+            "readiness_low": 0,
+            "readiness_high": 0,
+            "latest_score": 0,
+            "risk_level": "Unknown",
+            "result": "—",
+            "confidence": 0.0,
+            "attempts": len(exam_results),
+            "model_version": MODEL_VERSION,
+            "methodology": "Prediction model unavailable. The backend will retrain automatically; if this persists, restart the backend service.",
+        }
 
     if features is None:
         return {
