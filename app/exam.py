@@ -847,10 +847,10 @@ async def get_class_analytics(
         if created:
             day = created.strftime("%Y-%m-%d")
             daily[day].append(r.get("percentage", 0) or 0)
-    trend = sorted([
-        {"date": day, "avg_score": round(sum(scores) / len(scores), 1)}
-        for day, scores in daily.items()
-    ])[-14:]
+    trend = sorted(
+        [{"date": day, "avg_score": round(sum(scores) / len(scores), 1)} for day, scores in daily.items()],
+        key=lambda x: x["date"],
+    )[-14:]
 
     avg_latest = (
         round(sum(s["latest_score"] for s in students) / len(students), 1)
