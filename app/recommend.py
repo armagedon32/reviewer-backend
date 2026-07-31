@@ -17,6 +17,80 @@ ACTION_DEFINITIONS = {
 POLICY_VERSION = "bandit-v2"
 EXPERIMENT_SPLIT = 50  # 50% rule baseline, 50% bandit when rl_enabled=True
 
+REVIEW_MATERIALS = {
+    "LET": {
+        "GenEd": [
+            "LET General Education modules (English, Math, Science, Social Studies, Filipino)",
+            "PRC LET sample questions compilation",
+            "General Education competency video lessons",
+        ],
+        "ProfEd": [
+            "Professional Education reviewer (child development, assessment, curriculum)",
+            "Recent LET Professional Education past papers",
+            "Principles of teaching & classroom management guide",
+        ],
+        "Specialization": [
+            "Major specialization review modules aligned to your track",
+            "Field-specific practice drills and diagnostic sets",
+        ],
+    },
+    "CPA": {
+        "FAR": [
+            "FAR practice problem sets",
+            "PAS/PFRS summary guide",
+            "Financial accounting video lectures",
+        ],
+        "AFAR": [
+            "AFAR consolidated problem drills",
+            "Advanced accounting concepts workbook",
+        ],
+        "Auditing": [
+            "Auditing theory & practice reviewer",
+            "PSA summary notes",
+        ],
+        "MAS": [
+            "Management advisory services formula sheet",
+            "MAS practice exams",
+        ],
+        "RFBT": [
+            "Regulatory framework reviewer",
+            "Business law & SEC regulations digest",
+        ],
+        "Taxation": [
+            "Taxation law reviewer",
+            "BIR tax computation practice sets",
+        ],
+    },
+    "Internal Certification": {
+        "Core": ["Core competency modules", "Foundational concept drills"],
+        "Applied": ["Applied case studies", "Scenario-based practice sets"],
+        "Practicum": ["Practicum checklists", "Hands-on simulation guides"],
+    },
+}
+
+DIFFICULTY_BANDS = {
+    "board": {
+        "level": "board",
+        "label": "Board-Level",
+        "note": "Full-length timed mock boards at exam standard.",
+    },
+    "intermediate": {
+        "level": "intermediate",
+        "label": "Intermediate",
+        "note": "Mixed-subject drills approaching board difficulty.",
+    },
+    "guided": {
+        "level": "guided",
+        "label": "Guided",
+        "note": "Subject-focused practice with open review references.",
+    },
+    "foundational": {
+        "level": "foundational",
+        "label": "Foundational",
+        "note": "Remedial drills focusing on fundamentals before board practice.",
+    },
+}
+
 
 class RecommendationFeedback(BaseModel):
     action_id: str
@@ -122,6 +196,80 @@ def _rule_pick_action(context: dict):
     return "mixed_quiz", "Maintain mixed practice to improve consistency."
 
 
+def _recommend_difficulty(context: dict) -> dict:
+    score = context["latest_score"]
+    mastery = context["subject_mastery"]
+    avg_mastery = round(sum(mastery.values()) / len(mastery), 2) if mastery else 0
+    reference = max(score, avg_mastery)
+    if reference >= 90:
+        return dict(DIFFICULTY_BANDS["board"])
+    if reference >= 75:
+        return dict(DIFFICULTY_BANDS["intermediate"])
+    if reference >= 60:
+        return dict(DIFFICULTY_BANDS["guided"])
+    return dict(DIFFICULTY_BANDS["foundational"])
+
+
+def _recommend_materials(context: dict) -> list:
+    target = context.get("target_licensure") or ""
+    catalog = REVIEW_MATERIALS.get(target, {})
+    weak = context["weak_subjects"]
+    ordered = []
+    for subject in weak:
+        if subject in catalog:
+            ordered.append({"subject": subject, "items": catalog[subject]})
+    # Cover remaining assigned subjects that have materials.
+    for subject in catalog:
+        if subject not in weak:
+            ordered.append({"subject": subject, "items": catalog[subject]})
+    return ordered[:4]
+
+
+def _recommend_schedule(context: dict, action_id: str) -> list:
+    weak = context["weak_subjects"]
+    weak_focus = " · ".join(weak) if weak else "weakest areas"
+    base = {
+        "subject_drill": [
+            ("Day 1", f"Focused drill on {weak_focus}", "60 min"),
+            ("Day 2", f"Continue {weak_focus} remediation", "60 min"),
+            ("Day 3", "Mixed quiz: 30 items across all subjects", "45 min"),
+            ("Day 4", f"Re-test {weak_focus} after review", "45 min"),
+            ("Day 5", "Timed practice set at target difficulty", "60 min"),
+            ("Day 6", "Full mock exam", "120 min"),
+            ("Day 7", "Review mistakes & create summary notes", "45 min"),
+        ],
+        "mixed_quiz": [
+            ("Day 1", "Mixed quiz: 40 items (all subjects)", "50 min"),
+            ("Day 2", f"Targeted review of {weak_focus}", "60 min"),
+            ("Day 3", "Timed mixed quiz: 30 items", "45 min"),
+            ("Day 4", f"Drill {weak_focus}", "60 min"),
+            ("Day 5", "Mixed quiz: 50 items", "60 min"),
+            ("Day 6", "Full mock exam", "120 min"),
+            ("Day 7", "Analyze errors & plan next week", "30 min"),
+        ],
+        "timed_mock": [
+            ("Day 1", "Full-length timed mock exam", "120 min"),
+            ("Day 2", f"Score review & {weak_focus} remediation", "60 min"),
+            ("Day 3", "Timed practice set", "60 min"),
+            ("Day 4", f"Drill {weak_focus}", "60 min"),
+            ("Day 5", "Timed mixed quiz: 40 items", "50 min"),
+            ("Day 6", "Full mock exam", "120 min"),
+            ("Day 7", "Review & recovery / light reading", "45 min"),
+        ],
+        "remedial_lesson": [
+            ("Day 1", f"Remedial lesson: {weak_focus}", "60 min"),
+            ("Day 2", "Fundamental concept drills", "60 min"),
+            ("Day 3", f"Continue {weak_focus} remediation", "60 min"),
+            ("Day 4", "Guided practice set (open references)", "60 min"),
+            ("Day 5", f"Re-test {weak_focus}", "45 min"),
+            ("Day 6", "Light timed quiz: 20 items", "40 min"),
+            ("Day 7", "Rest & consolidate notes", "30 min"),
+        ],
+    }
+    rows = base.get(action_id, base["mixed_quiz"])
+    return [{"day": d, "activity": a, "duration": dur} for d, a, dur in rows]
+
+
 def _experiment_group(user_id: str) -> str:
     digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
     bucket = int(digest[:8], 16) % 100
@@ -187,6 +335,9 @@ async def get_next_action(current_user=Depends(get_current_user), db=Depends(get
         "latest_score": context["latest_score"],
         "score_delta": context["score_delta"],
         "pass_streak": context["pass_streak"],
+        "difficulty": _recommend_difficulty(context),
+        "materials": _recommend_materials(context),
+        "schedule": _recommend_schedule(context, action_id),
     }
 
 
