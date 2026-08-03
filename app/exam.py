@@ -833,6 +833,7 @@ async def get_class_analytics(
 
         track = (profile.get("let_track") or "").strip().lower().capitalize()
         students.append({
+            "user_id": uid,
             "email": user.get("email", "Unknown"),
             "latest_score": round(score, 1),
             "latest_result": latest.get("result", ""),
@@ -905,4 +906,139 @@ async def get_class_analytics(
         "students": sorted(students, key=lambda s: s["latest_score"]),
         "score_distribution": distribution,
         "trend": trend,
+    }
+
+
+@router.get("/student/{user_id}")
+async def get_individual_student_performance(
+    user_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if current_user["role"] not in {"instructor", "admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    try:
+        user_obj_id = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid student id")
+
+    user = await db.users.find_one({"_id": user_obj_id, "role": "student"})
+    if not user:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    profile = await db.student_profiles.find_one({"user_id": user_id})
+    profile = profile or {}
+
+    results = (
+        await db.exam_results.find({"user_id": user_id})
+        .sort("created_at", -1)
+        .to_list(length=None)
+    )
+    results = list(results)
+
+    history = [
+        {
+            "date": r.get("created_at").isoformat() if r.get("created_at") else None,
+            "exam_type": r.get("exam_type", ""),
+            "score": r.get("score", 0),
+            "total": r.get("total", 0),
+            "percentage": r.get("percentage", 0),
+            "result": r.get("result", ""),
+        }
+        for r in results
+    ]
+
+    percentages = [r.get("percentage", 0) or 0 for r in results]
+    total_attempts = len(percentages)
+    avg_score = round(sum(percentages) / total_attempts, 1) if total_attempts else 0
+    latest = results[0] if results else {}
+    passed = sum(1 for r in results if r.get("result") == "PASS")
+    fail_count = total_attempts - passed
+    pass_rate = round(passed / total_attempts * 100, 1) if total_attempts else 0
+    best_score = max(percentages) if percentages else 0
+    worst_score = min(percentages) if percentages else 0
+
+    subject_agg = {}
+    for r in results:
+        perf = r.get("subject_performance", {}) or {}
+        for subj, stat in perf.items():
+            agg = subject_agg.setdefault(subj, {"correct": 0, "total": 0, "appearances": 0})
+            agg["correct"] += stat.get("correct", 0)
+            agg["total"] += stat.get("total", 0)
+            agg["appearances"] += 1
+
+    subject_breakdown = []
+    for subj, agg in subject_agg.items():
+        avg_pct = round(agg["correct"] / agg["total"] * 100, 1) if agg["total"] else 0
+        subject_breakdown.append(
+            {
+                "subject": subj,
+                "correct": agg["correct"],
+                "total": agg["total"],
+                "appearances": agg["appearances"],
+                "avg_percentage": avg_pct,
+            }
+        )
+    subject_breakdown.sort(key=lambda s: s["avg_percentage"])
+    weak_subjects = [s["subject"] for s in subject_breakdown if s["avg_percentage"] < 60]
+
+    trend = [
+        {"date": r.get("created_at").strftime("%Y-%m-%d") if r.get("created_at") else "", "score": r.get("percentage", 0) or 0}
+        for r in reversed(results)
+    ][-20:]
+
+    recent = percentages[-3:]
+    recent_avg = round(sum(recent) / len(recent), 1) if recent else 0
+    if total_attempts == 0:
+        readiness_label = "No Data"
+        readiness_level = "none"
+    elif recent_avg >= 85 and pass_rate >= 80:
+        readiness_label = "Ready / High"
+        readiness_level = "high"
+    elif recent_avg >= 75:
+        readiness_label = "Approaching / Moderate"
+        readiness_level = "moderate"
+    elif recent_avg >= 60:
+        readiness_label = "Developing"
+        readiness_level = "developing"
+    else:
+        readiness_label = "At Risk"
+        readiness_level = "risk"
+
+    return {
+        "user_id": user_id,
+        "profile": {
+            "email": user.get("email", ""),
+            "student_id_number": profile.get("student_id_number", ""),
+            "first_name": profile.get("first_name", ""),
+            "middle_name": profile.get("middle_name", ""),
+            "last_name": profile.get("last_name", ""),
+            "username": profile.get("username", ""),
+            "program_degree": profile.get("program_degree", ""),
+            "year_level": profile.get("year_level"),
+            "section_class": profile.get("section_class", ""),
+            "status": profile.get("status", ""),
+            "target_licensure": profile.get("target_licensure", ""),
+            "let_track": profile.get("let_track", ""),
+            "major_specialization": profile.get("major_specialization", ""),
+            "assigned_review_subjects": profile.get("assigned_review_subjects", []),
+            "required_passing_threshold": profile.get("required_passing_threshold", 75),
+        },
+        "stats": {
+            "total_attempts": total_attempts,
+            "avg_score": avg_score,
+            "latest_score": round(latest.get("percentage", 0) or 0, 1),
+            "latest_result": latest.get("result", ""),
+            "pass_count": passed,
+            "fail_count": fail_count,
+            "pass_rate": pass_rate,
+            "best_score": best_score,
+            "worst_score": worst_score,
+        },
+        "history": history,
+        "subject_breakdown": subject_breakdown,
+        "weak_subjects": weak_subjects,
+        "trend": trend,
+        "readiness": {"label": readiness_label, "level": readiness_level, "recent_avg": recent_avg},
     }
