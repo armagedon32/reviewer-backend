@@ -476,6 +476,26 @@ async def update_question(
     return question_to_dict(updated)
 
 
+@router.delete("/{question_id}")
+async def delete_question(
+    question_id: str,
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] not in {"instructor", "admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    try:
+        oid = ObjectId(question_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid question id")
+
+    result = await db.questions.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Question not found")
+    return {"deleted": question_id}
+
+
 @router.post("/cleanup")
 async def cleanup_questions(
     current_user=Depends(get_current_user),
