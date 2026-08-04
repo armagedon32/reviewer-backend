@@ -627,6 +627,11 @@ async def get_exam_stats(
     avg_score = agg_result[0]["avg_score"] if agg_result else 0
     total_answered = agg_result[0]["total_answered"] if agg_result else 0
 
+    distinct_user_ids = await db.exam_results.distinct("user_id", exam_filter)
+    active_examinees = len([uid for uid in distinct_user_ids if uid])
+    passed = await db.exam_results.count_documents({**exam_filter, "result": "PASS"})
+    pass_rate = round(passed / attempts * 100, 1) if attempts else 0
+
     settings = await db.app_settings.find_one({})
     total_questions = settings["exam_question_count"] if settings else 50
     completion_rate = (
@@ -700,10 +705,12 @@ async def get_exam_stats(
             }
         )
 
-    return {
+return {
         "avg_score": round(avg_score, 2),
         "completion_rate": min(completion_rate, 100),
         "active_students": active_students,
+        "active_examinees": active_examinees,
+        "pass_rate": pass_rate,
         "recent_scores": recent_scores,
         "let_major_counts": let_major_counts,
         "recent_attempts": recent_attempt_log,
