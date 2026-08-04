@@ -703,9 +703,9 @@ async def get_exam_stats(
                 "major": major_label_for_profile(profile or {}),
                 "created_at": result.get("created_at").isoformat() if result.get("created_at") else None,
             }
-        )
+)
 
-return {
+    return {
         "avg_score": round(avg_score, 2),
         "completion_rate": min(completion_rate, 100),
         "active_students": active_students,
