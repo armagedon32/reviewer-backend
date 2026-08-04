@@ -298,6 +298,21 @@ async def get_next_action(current_user=Depends(get_current_user), db=Depends(get
         {"user_id": str(user["_id"]), "exam_type": profile.get("target_licensure")}
     ).sort("created_at", -1).to_list(length=50)
 
+    if not attempts:
+        return {
+            "has_recommendation": False,
+            "recommendation_id": None,
+            "rl_enabled": rl_enabled,
+            "action_id": None,
+            "action_label": None,
+            "reason": None,
+            "focus_subjects": [],
+            "latest_score": 0,
+            "difficulty": None,
+            "materials": [],
+            "schedule": [],
+        }
+
     context = _build_context(profile, attempts, passing_threshold)
 
     experiment_group = _experiment_group(str(user["_id"]))
@@ -323,6 +338,7 @@ async def get_next_action(current_user=Depends(get_current_user), db=Depends(get
     await db.rl_events.insert_one(event)
 
     return {
+        "has_recommendation": True,
         "recommendation_id": recommendation_id,
         "rl_enabled": rl_enabled,
         "policy_mode": policy_mode,
