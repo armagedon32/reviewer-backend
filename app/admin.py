@@ -133,6 +133,10 @@ class ProfileEditPermissionRequest(BaseModel):
     allowed: bool = True
 
 
+class UpdateRoleRequest(BaseModel):
+    role: Literal["student", "instructor", "admin"]
+
+
 def _generate_temp_password(length: int = 12) -> str:
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
@@ -510,6 +514,34 @@ async def update_user_status(
         f"User {'activated' if active else 'deactivated'}",
     )
     return {"id": user_id, "active": active}
+
+
+@router.put("/users/{user_id}/role")
+async def update_user_role(
+    user_id: str,
+    payload: UpdateRoleRequest,
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    target = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    actor = await db.users.find_one({"email": current_user.get("email")})
+    if actor and str(actor["_id"]) == str(target["_id"]):
+        raise HTTPException(status_code=400, detail="You cannot change your own role")
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"role": payload.role}},
+    )
+    await log_event_async(
+        db,
+        user_id,
+        "user_role",
+        f"Role changed to {payload.role}",
+    )
+    return {"id": user_id, "role": payload.role}
 
 
 @router.post("/users/{user_id}/profile-edit-permission")
