@@ -1,8 +1,5 @@
 from datetime import datetime, timedelta
 import bisect
-import hashlib
-import random
-from collections import defaultdict
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -17,8 +14,7 @@ ACTION_DEFINITIONS = {
     "timed_mock": "Timed Full Mock Board",
     "remedial_lesson": "Remedial Lesson Block",
 }
-POLICY_VERSION = "bandit-v3"
-EXPERIMENT_SPLIT = 50  # 50% no-learning baseline, 50% Thompson bandit when rl_enabled=True
+POLICY_VERSION = "adaptive-rules-v1"
 
 REVIEW_MATERIALS = {
     "LET": {
@@ -94,8 +90,42 @@ DIFFICULTY_BANDS = {
     },
 }
 
+# Predefined policy-like decision rules. The reference score (max of latest
+# score and average subject mastery) is mapped to an action through a fixed
+# threshold table — the manuscript's rule-based adaptive logic. No autonomous
+# policy learning or reward optimization occurs; the rules are fixed by design.
 DIFFICULTY_BREAKPOINTS = [60, 75, 90]
-DIFFICULTY_ORDER = ["foundational", "guided", "intermediate", "board"]
+
+ACTION_RULES = [
+    {
+        "band": "Basic",
+        "condition": "below 60%",
+        "action_id": "remedial_lesson",
+        "action_label": "Remedial Lesson Block",
+        "difficulty_level": "foundational",
+    },
+    {
+        "band": "Intermediate",
+        "condition": "60% - 74%",
+        "action_id": "subject_drill",
+        "action_label": "Focused Subject Drill",
+        "difficulty_level": "guided",
+    },
+    {
+        "band": "Advanced",
+        "condition": "75% - 89%",
+        "action_id": "mixed_quiz",
+        "action_label": "Mixed Topic Quiz",
+        "difficulty_level": "intermediate",
+    },
+    {
+        "band": "Certification-Ready",
+        "condition": "90% and above",
+        "action_id": "timed_mock",
+        "action_label": "Timed Full Mock Board",
+        "difficulty_level": "board",
+    },
+]
 
 
 class RecommendationFeedback(BaseModel):
@@ -130,9 +160,9 @@ def _build_context(profile: dict, attempts: list, passing_threshold: int):
 
     streak = 0
     for attempt in attempts:
-        if float(attempt.get("percentage", 0)) >= passing_threshold:
-            streak += 1
-        else:
+        passing = float(attempt.get("percentage", 0)) >= passing_threshold
+        streak += int(passing)
+        if not passing:
             break
 
     mastery = _subject_mastery_from_attempts(attempts[:10])
@@ -148,56 +178,29 @@ def _build_context(profile: dict, attempts: list, passing_threshold: int):
     }
 
 
-async def _load_action_history(db, user_id: str) -> dict:
-    history = defaultdict(lambda: {"success": 0.0, "failure": 0.0})
-    cursor = db.rl_events.find(
-        {"user_id": user_id, "event_type": "feedback"},
-        {"action_id": 1, "reward": 1},
-    )
-    for event in await cursor.to_list(length=500):
-        reward = float(event.get("reward", 0))
-        success = max(reward, 0.0)
-        failure = max(-reward, 0.0)
-        stats = history[event.get("action_id")]
-        stats["success"] += success
-        stats["failure"] += failure
-    return history
+def _reference_score(context: dict) -> float:
+    mastery = context["subject_mastery"]
+    avg_mastery = round(sum(mastery.values()) / (len(mastery) or 1), 2)
+    return max(context["latest_score"], avg_mastery)
 
 
-def _thompson_sample(history: dict) -> str:
-    # Draw one sample from each action's Beta posterior (prior Beta(1,1) =
-    # uniform before any rewards). The action with the highest draw wins.
-    samples = {
-        action_id: random.betavariate(
-            1.0 + history.get(action_id, {}).get("success", 0.0),
-            1.0 + history.get(action_id, {}).get("failure", 0.0),
-        )
-        for action_id in ACTION_DEFINITIONS
-    }
-    return max(samples, key=samples.get)
+def _pick_rule(context: dict) -> dict:
+    index = bisect.bisect_left(DIFFICULTY_BREAKPOINTS, _reference_score(context))
+    return ACTION_RULES[index]
 
 
-def _explain_thompson(action_id: str, sample_count: int, context: dict) -> str:
+def _explain_rule(rule: dict, context: dict) -> str:
     weak = " · ".join(context.get("weak_subjects") or [])
     return (
-        f"Thompson sampling over {sample_count} observed outcome(s) selected "
-        f"{ACTION_DEFINITIONS[action_id]}. Weak areas: {weak or 'none yet'}."
+        f"Adaptive rule ({rule['band']}, reference {_reference_score(context):.1f}%): "
+        f"{rule['condition']} mastery maps to {rule['action_label']}. "
+        f"Weak areas: {weak or 'none yet'}."
     )
-
-
-def _baseline_pick_action(context: dict):
-    action_id = random.choice(list(ACTION_DEFINITIONS.keys()))
-    return action_id, "Uniform random exploration (baseline arm, no learning)."
 
 
 def _recommend_difficulty(context: dict) -> dict:
-    score = context["latest_score"]
-    mastery = context["subject_mastery"]
-    denominator = len(mastery) or 1
-    avg_mastery = round(sum(mastery.values()) / denominator, 2)
-    reference = max(score, avg_mastery)
-    index = bisect.bisect_left(DIFFICULTY_BREAKPOINTS, reference)
-    return dict(DIFFICULTY_BANDS[DIFFICULTY_ORDER[index]])
+    rule = _pick_rule(context)
+    return dict(DIFFICULTY_BANDS[rule["difficulty_level"]])
 
 
 def _recommend_materials(context: dict) -> list:
@@ -208,7 +211,6 @@ def _recommend_materials(context: dict) -> list:
     for subject in weak:
         if subject in catalog:
             ordered.append({"subject": subject, "items": catalog[subject]})
-    # Cover remaining assigned subjects that have materials.
     for subject in catalog:
         if subject not in weak:
             ordered.append({"subject": subject, "items": catalog[subject]})
@@ -260,12 +262,6 @@ def _recommend_schedule(context: dict, action_id: str) -> list:
     return [{"day": d, "activity": a, "duration": dur} for d, a, dur in rows]
 
 
-def _experiment_group(user_id: str) -> str:
-    digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
-    bucket = int(digest[:8], 16) % 100
-    return "baseline" if bucket < EXPERIMENT_SPLIT else "bandit"
-
-
 @router.get("/next-action")
 async def get_next_action(current_user=Depends(get_current_user), db=Depends(get_database)):
     user = await db.users.find_one({"email": current_user["email"]})
@@ -304,31 +300,35 @@ async def get_next_action(current_user=Depends(get_current_user), db=Depends(get
         }
 
     context = _build_context(profile, attempts, passing_threshold)
-
-    experiment_group = _experiment_group(str(user["_id"]))
     recommendation_id = str(uuid4())
-    policy_mode = "bandit" if (rl_enabled and experiment_group == "bandit") else "baseline"
-    if policy_mode == "bandit":
-        history = await _load_action_history(db, str(user["_id"]))
-        action_id = _thompson_sample(history)
-        sample_count = int(
-            sum(
-                history[action_id]["success"] + history[action_id]["failure"]
-                for action_id in ACTION_DEFINITIONS
-            )
-        )
-        reason = _explain_thompson(action_id, sample_count, context)
-    else:
-        action_id, reason = _baseline_pick_action(context)
+
+    if not rl_enabled:
+        return {
+            "has_recommendation": False,
+            "recommendation_id": None,
+            "rl_enabled": False,
+            "action_id": None,
+            "action_label": None,
+            "reason": None,
+            "focus_subjects": [],
+            "latest_score": context["latest_score"],
+            "difficulty": None,
+            "materials": [],
+            "schedule": [],
+        }
+
+    rule = _pick_rule(context)
+    action_id = rule["action_id"]
 
     event = {
         "recommendation_id": recommendation_id,
         "user_id": str(user["_id"]),
         "event_type": "recommendation",
         "action_id": action_id,
-        "policy_mode": policy_mode,
+        "policy_mode": "rule_adaptive",
         "policy_version": POLICY_VERSION,
-        "experiment_group": experiment_group,
+        "decision_band": rule["band"],
+        "reference_score": _reference_score(context),
         "context": context,
         "created_at": datetime.utcnow(),
     }
@@ -337,13 +337,13 @@ async def get_next_action(current_user=Depends(get_current_user), db=Depends(get
     return {
         "has_recommendation": True,
         "recommendation_id": recommendation_id,
-        "rl_enabled": rl_enabled,
-        "policy_mode": policy_mode,
+        "rl_enabled": True,
+        "policy_mode": "rule_adaptive",
         "policy_version": POLICY_VERSION,
-        "experiment_group": experiment_group,
+        "decision_band": rule["band"],
         "action_id": action_id,
         "action_label": ACTION_DEFINITIONS[action_id],
-        "reason": reason,
+        "reason": _explain_rule(rule, context),
         "focus_subjects": context["weak_subjects"],
         "latest_score": context["latest_score"],
         "score_delta": context["score_delta"],
@@ -366,16 +366,6 @@ async def post_feedback(
     if payload.action_id not in ACTION_DEFINITIONS:
         raise HTTPException(status_code=400, detail="Invalid action_id")
 
-    recommendation = None
-    if payload.recommendation_id:
-        recommendation = await db.rl_events.find_one(
-            {
-                "recommendation_id": payload.recommendation_id,
-                "user_id": str(user["_id"]),
-                "event_type": "recommendation",
-            }
-        )
-
     await db.rl_events.insert_one(
         {
             "user_id": str(user["_id"]),
@@ -384,9 +374,7 @@ async def post_feedback(
             "reward": float(payload.reward),
             "note": payload.note or "",
             "recommendation_id": payload.recommendation_id,
-            "policy_mode": recommendation.get("policy_mode") if recommendation else None,
-            "policy_version": recommendation.get("policy_version") if recommendation else POLICY_VERSION,
-            "experiment_group": recommendation.get("experiment_group") if recommendation else None,
+            "policy_version": POLICY_VERSION,
             "created_at": datetime.utcnow(),
         }
     )
@@ -405,38 +393,17 @@ async def get_admin_rl_metrics(current_user=Depends(get_current_user), db=Depend
     feedback = [event for event in events if event.get("event_type") == "feedback"]
 
     action_counts = {action_id: 0 for action_id in ACTION_DEFINITIONS}
+    rule_counts = {rule["band"]: 0 for rule in ACTION_RULES}
     for event in recommendations:
         action_id = event.get("action_id")
         if action_id in action_counts:
             action_counts[action_id] += 1
+        band = event.get("decision_band")
+        if band in rule_counts:
+            rule_counts[band] += 1
 
-    by_group = {
-        "baseline": {"recommendations": 0, "feedback_count": 0, "avg_reward": 0.0},
-        "bandit": {"recommendations": 0, "feedback_count": 0, "avg_reward": 0.0},
-    }
-    reward_acc = {"baseline": 0.0, "bandit": 0.0}
-    policy_mode_counts = {
-        "baseline": 0,
-        "bandit": 0,
-    }
-
-    for event in recommendations:
-        group = event.get("experiment_group")
-        if group in by_group:
-            by_group[group]["recommendations"] += 1
-        mode = event.get("policy_mode")
-        if mode in policy_mode_counts:
-            policy_mode_counts[mode] += 1
-
-    for event in feedback:
-        group = event.get("experiment_group")
-        if group in by_group:
-            by_group[group]["feedback_count"] += 1
-            reward_acc[group] += float(event.get("reward", 0))
-
-    for group in ("baseline", "bandit"):
-        count = by_group[group]["feedback_count"]
-        by_group[group]["avg_reward"] = round(reward_acc[group] / count, 4) if count else 0.0
+    deltas = [float(event.get("reward", 0)) for event in feedback]
+    avg_delta = round(sum(deltas) / len(deltas), 4) if deltas else 0.0
 
     settings = await db.app_settings.find_one({}) or {}
     rl_enabled = bool(settings.get("rl_enabled", False))
@@ -445,10 +412,19 @@ async def get_admin_rl_metrics(current_user=Depends(get_current_user), db=Depend
         "policy_version": POLICY_VERSION,
         "window_days": 30,
         "rl_enabled": rl_enabled,
-        "experiment_split": EXPERIMENT_SPLIT,
         "recommendations_total": len(recommendations),
         "feedback_total": len(feedback),
         "action_distribution": action_counts,
-        "policy_mode_counts": policy_mode_counts,
-        "ab_groups": by_group,
+        "rule_distribution": rule_counts,
+        "avg_performance_delta": avg_delta,
+        "decision_rules": [
+            {
+                "band": rule["band"],
+                "condition": rule["condition"],
+                "action_id": rule["action_id"],
+                "action_label": rule["action_label"],
+                "difficulty": DIFFICULTY_BANDS[rule["difficulty_level"]]["label"],
+            }
+            for rule in ACTION_RULES
+        ],
     }

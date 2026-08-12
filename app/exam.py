@@ -51,15 +51,7 @@ async def _apply_auto_recommendation_reward(
     previous_result = (previous_attempt.get("result") or "") if previous_attempt else ""
 
     delta = float(percentage) - previous_percentage
-    reward = _clamp(delta / 20.0, -1.0, 1.0)
-    if result == "PASS" and previous_result != "PASS":
-        reward = _clamp(reward + 0.30, -1.0, 1.0)
-    if result == "FAIL" and previous_result == "PASS":
-        reward = _clamp(reward - 0.30, -1.0, 1.0)
-    if result == "PASS" and delta == 0:
-        reward = _clamp(reward + 0.10, -1.0, 1.0)
-    if result == "FAIL" and delta == 0:
-        reward = _clamp(reward - 0.10, -1.0, 1.0)
+    feedback_delta = _clamp(delta / 20.0, -1.0, 1.0)
 
     now = datetime.utcnow()
     await db.rl_events.update_one(
@@ -67,7 +59,7 @@ async def _apply_auto_recommendation_reward(
         {
             "$set": {
                 "rewarded_at": now,
-                "auto_reward": float(round(reward, 4)),
+                "performance_delta": float(round(feedback_delta, 4)),
                 "outcome": {
                     "exam_type": exam_type,
                     "previous_percentage": previous_percentage,
@@ -84,8 +76,8 @@ async def _apply_auto_recommendation_reward(
             "user_id": user_id,
             "event_type": "feedback",
             "action_id": latest_recommendation.get("action_id"),
-            "reward": float(round(reward, 4)),
-            "note": "auto_outcome_reward",
+            "reward": float(round(feedback_delta, 4)),
+            "note": "auto_performance_feedback",
             "created_at": now,
         }
     )
