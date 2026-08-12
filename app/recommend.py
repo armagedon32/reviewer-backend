@@ -418,11 +418,19 @@ async def get_admin_rl_metrics(current_user=Depends(get_current_user), db=Depend
         "bandit": {"recommendations": 0, "feedback_count": 0, "avg_reward": 0.0},
     }
     reward_acc = {"baseline": 0.0, "bandit": 0.0}
+    policy_mode_counts = {
+        "rule_disabled": 0,
+        "rule_baseline": 0,
+        "bandit": 0,
+    }
 
     for event in recommendations:
         group = event.get("experiment_group")
         if group in by_group:
             by_group[group]["recommendations"] += 1
+        mode = event.get("policy_mode")
+        if mode in policy_mode_counts:
+            policy_mode_counts[mode] += 1
 
     for event in feedback:
         group = event.get("experiment_group")
@@ -434,11 +442,17 @@ async def get_admin_rl_metrics(current_user=Depends(get_current_user), db=Depend
         count = by_group[group]["feedback_count"]
         by_group[group]["avg_reward"] = round(reward_acc[group] / count, 4) if count else 0.0
 
+    settings = await db.app_settings.find_one({}) or {}
+    rl_enabled = bool(settings.get("rl_enabled", False))
+
     return {
         "policy_version": POLICY_VERSION,
         "window_days": 30,
+        "rl_enabled": rl_enabled,
+        "experiment_split": EXPERIMENT_SPLIT,
         "recommendations_total": len(recommendations),
         "feedback_total": len(feedback),
         "action_distribution": action_counts,
+        "policy_mode_counts": policy_mode_counts,
         "ab_groups": by_group,
     }
