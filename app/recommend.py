@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta
+from typing import Optional
 from uuid import uuid4
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from .auth import get_current_user
 from .database import get_database
@@ -435,6 +436,92 @@ async def get_admin_rl_metrics(current_user=Depends(get_current_user), db=Depend
         "feedback_total": len(feedback),
         "action_distribution": action_counts,
         "rule_distribution": rule_counts,
+        "avg_performance_delta": avg_delta,
+        "decision_rules": [
+            {
+                "band": rule["band"],
+                "condition": rule["condition"],
+                "action_id": rule["action_id"],
+                "action_label": rule["action_label"],
+                "difficulty": DIFFICULTY_BANDS[rule["difficulty_level"]]["label"],
+            }
+            for rule in ACTION_RULES
+        ],
+    }
+
+
+@router.get("/instructor/metrics")
+async def get_instructor_rl_metrics(
+    program: Optional[str] = Query(default=None),
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if current_user["role"] not in {"instructor", "admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    program_filter = program.strip() if program else None
+
+    active_users = await db.users.find({"role": "student", "active": True}).to_list(length=None)
+    active_user_ids = [str(u["_id"]) for u in active_users]
+    user_by_id = {str(u["_id"]): u for u in active_users}
+
+    profile_query = {"user_id": {"$in": active_user_ids}}
+    if program_filter:
+        profile_query["target_licensure"] = program_filter
+    profiles = await db.student_profiles.find(profile_query).to_list(length=None)
+    profile_by_user = {p["user_id"]: p for p in profiles}
+    enrolled_ids = list(profile_by_user.keys())
+
+    since = datetime.utcnow() - timedelta(days=30)
+    events = await db.rl_events.find(
+        {"created_at": {"$gte": since}, "user_id": {"$in": enrolled_ids}}
+    ).to_list(length=5000)
+
+    recommendations = [event for event in events if event.get("event_type") == "recommendation"]
+    feedback = [event for event in events if event.get("event_type") == "feedback"]
+
+    action_counts = {action_id: 0 for action_id in ACTION_DEFINITIONS}
+    rule_counts = {rule["band"]: 0 for rule in ACTION_RULES}
+    student_last_band = {}
+    for event in recommendations:
+        action_id = event.get("action_id")
+        if action_id in action_counts:
+            action_counts[action_id] += 1
+        band = event.get("decision_band")
+        if band in rule_counts:
+            rule_counts[band] += 1
+        student_last_band[event.get("user_id")] = band
+
+    deltas = [float(event.get("reward", 0)) for event in feedback]
+    avg_delta = round(sum(deltas) / len(deltas), 4) if deltas else 0.0
+
+    band_members = {}
+    for band in rule_counts:
+        band_members[band] = []
+    for user_id, band in student_last_band.items():
+        if band in band_members:
+            profile = profile_by_user.get(user_id) or {}
+            name = (
+                f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
+                or user_by_id.get(user_id, {}).get("email", "—")
+            )
+            band_members[band].append({"user_id": user_id, "name": name})
+
+    settings = await db.app_settings.find_one({}) or {}
+    rl_enabled = bool(settings.get("rl_enabled", False))
+
+    return {
+        "policy_version": POLICY_VERSION,
+        "program": program_filter or "All Programs",
+        "window_days": 30,
+        "rl_enabled": rl_enabled,
+        "students_total": len(enrolled_ids),
+        "students_recommended": len(student_last_band),
+        "recommendations_total": len(recommendations),
+        "feedback_total": len(feedback),
+        "action_distribution": action_counts,
+        "rule_distribution": rule_counts,
+        "band_members": band_members,
         "avg_performance_delta": avg_delta,
         "decision_rules": [
             {
