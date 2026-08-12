@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta
+import bisect
 import hashlib
+import random
+from collections import defaultdict
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -14,8 +17,8 @@ ACTION_DEFINITIONS = {
     "timed_mock": "Timed Full Mock Board",
     "remedial_lesson": "Remedial Lesson Block",
 }
-POLICY_VERSION = "bandit-v2"
-EXPERIMENT_SPLIT = 50  # 50% rule baseline, 50% bandit when rl_enabled=True
+POLICY_VERSION = "bandit-v3"
+EXPERIMENT_SPLIT = 50  # 50% no-learning baseline, 50% Thompson bandit when rl_enabled=True
 
 REVIEW_MATERIALS = {
     "LET": {
@@ -91,6 +94,9 @@ DIFFICULTY_BANDS = {
     },
 }
 
+DIFFICULTY_BREAKPOINTS = [60, 75, 90]
+DIFFICULTY_ORDER = ["foundational", "guided", "intermediate", "board"]
+
 
 class RecommendationFeedback(BaseModel):
     action_id: str
@@ -142,72 +148,56 @@ def _build_context(profile: dict, attempts: list, passing_threshold: int):
     }
 
 
-async def _thompson_pick_action(db, user_id: str, context: dict):
-    # Phase 1: deterministic guardrails + Thompson-like sampling from observed rewards.
-    latest_score = context["latest_score"]
-    score_delta = context["score_delta"]
-    weak_subjects = context["weak_subjects"]
-
-    # Guardrails first.
-    if latest_score < 50:
-        return "remedial_lesson", "Low mastery detected; start with remediation."
-    if weak_subjects and latest_score < 75:
-        return "subject_drill", f"Focus on weakest areas: {', '.join(weak_subjects)}."
-    if score_delta < -5:
-        return "mixed_quiz", "Recent decline detected; use mixed practice to stabilize retention."
-    if latest_score >= 75:
-        return "timed_mock", "Strong baseline; increase exam realism with timed mock."
-
-    # Bandit fallback from historical rewards for this user.
-    action_scores = {action_id: 0.0 for action_id in ACTION_DEFINITIONS}
-    action_counts = {action_id: 0 for action_id in ACTION_DEFINITIONS}
+async def _load_action_history(db, user_id: str) -> dict:
+    history = defaultdict(lambda: {"success": 0.0, "failure": 0.0})
     cursor = db.rl_events.find(
         {"user_id": user_id, "event_type": "feedback"},
         {"action_id": 1, "reward": 1},
     )
-    events = await cursor.to_list(length=500)
-    for event in events:
-        action_id = event.get("action_id")
-        if action_id not in action_scores:
-            continue
-        action_scores[action_id] += float(event.get("reward", 0))
-        action_counts[action_id] += 1
-    ranked = sorted(
-        ACTION_DEFINITIONS.keys(),
-        key=lambda action_id: (action_scores[action_id] / (action_counts[action_id] or 1)),
-        reverse=True,
+    for event in await cursor.to_list(length=500):
+        reward = float(event.get("reward", 0))
+        success = max(reward, 0.0)
+        failure = max(-reward, 0.0)
+        stats = history[event.get("action_id")]
+        stats["success"] += success
+        stats["failure"] += failure
+    return history
+
+
+def _thompson_sample(history: dict) -> str:
+    # Draw one sample from each action's Beta posterior (prior Beta(1,1) =
+    # uniform before any rewards). The action with the highest draw wins.
+    samples = {
+        action_id: random.betavariate(
+            1.0 + history.get(action_id, {}).get("success", 0.0),
+            1.0 + history.get(action_id, {}).get("failure", 0.0),
+        )
+        for action_id in ACTION_DEFINITIONS
+    }
+    return max(samples, key=samples.get)
+
+
+def _explain_thompson(action_id: str, sample_count: int, context: dict) -> str:
+    weak = " · ".join(context.get("weak_subjects") or [])
+    return (
+        f"Thompson sampling over {sample_count} observed outcome(s) selected "
+        f"{ACTION_DEFINITIONS[action_id]}. Weak areas: {weak or 'none yet'}."
     )
-    best_action = ranked[0] if ranked else "mixed_quiz"
-    return best_action, "Personalized using your historical outcomes."
 
 
-def _rule_pick_action(context: dict):
-    latest_score = context["latest_score"]
-    score_delta = context["score_delta"]
-    weak_subjects = context["weak_subjects"]
-    if latest_score < 50:
-        return "remedial_lesson", "Low mastery detected; start with remediation."
-    if weak_subjects and latest_score < 75:
-        return "subject_drill", f"Focus on weakest areas: {', '.join(weak_subjects)}."
-    if score_delta < -5:
-        return "mixed_quiz", "Recent decline detected; use mixed practice to stabilize retention."
-    if latest_score >= 75:
-        return "timed_mock", "Strong baseline; increase exam realism with timed mock."
-    return "mixed_quiz", "Maintain mixed practice to improve consistency."
+def _baseline_pick_action(context: dict):
+    action_id = random.choice(list(ACTION_DEFINITIONS.keys()))
+    return action_id, "Uniform random exploration (baseline arm, no learning)."
 
 
 def _recommend_difficulty(context: dict) -> dict:
     score = context["latest_score"]
     mastery = context["subject_mastery"]
-    avg_mastery = round(sum(mastery.values()) / len(mastery), 2) if mastery else 0
+    denominator = len(mastery) or 1
+    avg_mastery = round(sum(mastery.values()) / denominator, 2)
     reference = max(score, avg_mastery)
-    if reference >= 90:
-        return dict(DIFFICULTY_BANDS["board"])
-    if reference >= 75:
-        return dict(DIFFICULTY_BANDS["intermediate"])
-    if reference >= 60:
-        return dict(DIFFICULTY_BANDS["guided"])
-    return dict(DIFFICULTY_BANDS["foundational"])
+    index = bisect.bisect_left(DIFFICULTY_BREAKPOINTS, reference)
+    return dict(DIFFICULTY_BANDS[DIFFICULTY_ORDER[index]])
 
 
 def _recommend_materials(context: dict) -> list:
@@ -317,12 +307,19 @@ async def get_next_action(current_user=Depends(get_current_user), db=Depends(get
 
     experiment_group = _experiment_group(str(user["_id"]))
     recommendation_id = str(uuid4())
-    if rl_enabled and experiment_group == "bandit":
-        action_id, reason = await _thompson_pick_action(db, str(user["_id"]), context)
-        policy_mode = "bandit"
+    policy_mode = "bandit" if (rl_enabled and experiment_group == "bandit") else "baseline"
+    if policy_mode == "bandit":
+        history = await _load_action_history(db, str(user["_id"]))
+        action_id = _thompson_sample(history)
+        sample_count = int(
+            sum(
+                history[action_id]["success"] + history[action_id]["failure"]
+                for action_id in ACTION_DEFINITIONS
+            )
+        )
+        reason = _explain_thompson(action_id, sample_count, context)
     else:
-        action_id, reason = _rule_pick_action(context)
-        policy_mode = "rule_baseline" if rl_enabled else "rule_disabled"
+        action_id, reason = _baseline_pick_action(context)
 
     event = {
         "recommendation_id": recommendation_id,
@@ -419,8 +416,7 @@ async def get_admin_rl_metrics(current_user=Depends(get_current_user), db=Depend
     }
     reward_acc = {"baseline": 0.0, "bandit": 0.0}
     policy_mode_counts = {
-        "rule_disabled": 0,
-        "rule_baseline": 0,
+        "baseline": 0,
         "bandit": 0,
     }
 
