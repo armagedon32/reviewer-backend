@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
-import bisect
 from uuid import uuid4
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from .auth import get_current_user
@@ -136,44 +136,64 @@ class RecommendationFeedback(BaseModel):
 
 
 def _subject_mastery_from_attempts(attempts):
-    totals = {}
-    for attempt in attempts:
-        subject_perf = attempt.get("subject_performance") or {}
-        for subject, stats in subject_perf.items():
-            if subject not in totals:
-                totals[subject] = {"correct": 0.0, "total": 0.0}
-            totals[subject]["correct"] += float(stats.get("correct", 0) or 0)
-            totals[subject]["total"] += float(stats.get("total", 0) or 0)
-    mastery = {}
-    for subject, values in totals.items():
-        if values["total"] > 0:
-            mastery[subject] = round((values["correct"] / values["total"]) * 100, 2)
-    return mastery
+    records = [
+        (subject, float(stats.get("correct", 0) or 0), float(stats.get("total", 0) or 0))
+        for attempt in attempts
+        for subject, stats in (attempt.get("subject_performance") or {}).items()
+    ]
+    names = np.array([rec[0] for rec in records])
+    correct = np.array([rec[1] for rec in records])
+    total = np.array([rec[2] for rec in records])
+    unique = np.unique(names)
+    correct_sum = np.array([correct[names == name].sum() for name in unique], dtype=float)
+    total_sum = np.array([total[names == name].sum() for name in unique], dtype=float)
+    mastery = np.divide(
+        correct_sum,
+        total_sum,
+        out=np.zeros_like(correct_sum),
+        where=total_sum > 0,
+    )
+    return {
+        name: round(float(score * 100), 2)
+        for name, score in zip(unique.tolist(), mastery.tolist())
+    }
+
+
+def _streak(percentages: np.ndarray, passing_threshold: float) -> int:
+    passing = (percentages >= passing_threshold).astype(int)
+    n = passing.shape[0]
+    indices = np.arange(n) + 1
+    stop = indices * (1 - passing) + (n + 1) * passing
+    return int(stop.min() - 1)
+
+
+def _weak_subjects(mastery: dict, passing_threshold: int) -> list:
+    order = sorted(mastery.items(), key=lambda item: item[1])
+    names = np.array([name for name, _ in order])
+    values = np.array([value for _, value in order])
+    mask = (values < passing_threshold).astype(bool)
+    return names[mask][:3].tolist()
 
 
 def _build_context(profile: dict, attempts: list, passing_threshold: int):
-    latest = attempts[0] if attempts else None
-    previous = attempts[1] if len(attempts) > 1 else latest
-    latest_score = float(latest.get("percentage", 0) if latest else 0)
-    previous_score = float(previous.get("percentage", latest_score) if previous else latest_score)
+    latest = attempts[0]
+    previous = attempts[min(len(attempts) - 1, 1)]
+    latest_score = float(latest.get("percentage", 0))
+    previous_score = float(previous.get("percentage", latest_score))
     score_delta = latest_score - previous_score
 
-    streak = 0
-    for attempt in attempts:
-        passing = float(attempt.get("percentage", 0)) >= passing_threshold
-        streak += int(passing)
-        if not passing:
-            break
+    percentages = np.array([float(a.get("percentage", 0)) for a in attempts])
+    streak = _streak(percentages, passing_threshold)
 
     mastery = _subject_mastery_from_attempts(attempts[:10])
-    weak_subjects = [k for k, v in sorted(mastery.items(), key=lambda item: item[1]) if v < passing_threshold]
+    weak = _weak_subjects(mastery, passing_threshold)
     return {
         "target_licensure": profile.get("target_licensure"),
         "latest_score": latest_score,
         "score_delta": score_delta,
         "attempt_count": len(attempts),
         "pass_streak": streak,
-        "weak_subjects": weak_subjects[:3],
+        "weak_subjects": weak,
         "subject_mastery": mastery,
     }
 
@@ -185,7 +205,7 @@ def _reference_score(context: dict) -> float:
 
 
 def _pick_rule(context: dict) -> dict:
-    index = bisect.bisect_left(DIFFICULTY_BREAKPOINTS, _reference_score(context))
+    index = int(np.searchsorted(DIFFICULTY_BREAKPOINTS, _reference_score(context), side="right"))
     return ACTION_RULES[index]
 
 
@@ -207,19 +227,18 @@ def _recommend_materials(context: dict) -> list:
     target = context.get("target_licensure") or ""
     catalog = REVIEW_MATERIALS.get(target, {})
     weak = context["weak_subjects"]
-    ordered = []
-    for subject in weak:
-        if subject in catalog:
-            ordered.append({"subject": subject, "items": catalog[subject]})
-    for subject in catalog:
-        if subject not in weak:
-            ordered.append({"subject": subject, "items": catalog[subject]})
+    catalog_names = np.array(list(catalog.keys()))
+    in_weak = np.isin(catalog_names, weak)
+    ordered = (
+        [{"subject": subject, "items": catalog[subject]} for subject in catalog_names[in_weak]]
+        + [{"subject": subject, "items": catalog[subject]} for subject in catalog_names[~in_weak]]
+    )
     return ordered[:4]
 
 
 def _recommend_schedule(context: dict, action_id: str) -> list:
     weak = context["weak_subjects"]
-    weak_focus = " · ".join(weak) if weak else "weakest areas"
+    weak_focus = " · ".join(weak) or "weakest areas"
     base = {
         "subject_drill": [
             ("Day 1", f"Focused drill on {weak_focus}", "60 min"),
