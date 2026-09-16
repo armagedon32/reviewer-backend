@@ -624,7 +624,7 @@ async def bulk_delete_users(
     if not student_ids:
         return {"deleted": 0, "students": 0}
 
-    email_by_id = {user_id: user["email"] for user in users}
+    email_by_id = {str(user["_id"]): user["email"] for user in users}
     await db.exam_results.delete_many({"user_id": {"$in": student_ids}})
     await db.student_profiles.delete_many({"user_id": {"$in": student_ids}})
     await db.audit_logs.delete_many({"user_id": {"$in": student_ids}})
