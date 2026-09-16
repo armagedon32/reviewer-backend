@@ -149,6 +149,25 @@ def _generate_temp_password(length: int = 12) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+async def _profile_is_complete(db, user) -> bool:
+    role = user["role"]
+    if role == "admin":
+        return True
+    user_id = str(user["_id"])
+    if role == "student":
+        profile = await db.student_profiles.find_one(
+            {"user_id": user_id}, {"_id": 1}
+        )
+        return profile is not None
+    if role == "instructor":
+        log = await db.audit_logs.find_one(
+            {"user_id": user_id, "action": "access_request"},
+            sort=[("created_at", -1)],
+        )
+        return log is not None
+    return False
+
+
 async def get_or_create_settings(db):
     settings = await db.app_settings.find_one({})
     if settings:
@@ -436,6 +455,20 @@ async def list_users(current_user=Depends(get_current_user), db = Depends(get_da
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
     users = await db.users.find().sort("created_at", -1).to_list(length=None)
+    student_ids = [str(u["_id"]) for u in users if u["role"] == "student"]
+    instructor_ids = [str(u["_id"]) for u in users if u["role"] == "instructor"]
+    completed = set()
+    if student_ids:
+        profiles = await db.student_profiles.find(
+            {"user_id": {"$in": student_ids}}, {"user_id": 1}
+        ).to_list(length=None)
+        completed.update(p["user_id"] for p in profiles)
+    if instructor_ids:
+        logs = await db.audit_logs.find(
+            {"action": "access_request", "user_id": {"$in": instructor_ids}},
+            {"user_id": 1},
+        ).to_list(length=None)
+        completed.update(str(log.get("user_id")) for log in logs)
     return [
         {
             "id": str(user["_id"]),
@@ -443,6 +476,7 @@ async def list_users(current_user=Depends(get_current_user), db = Depends(get_da
             "role": user["role"],
             "active": user.get("active", True),
             "profile_edit_allowed": bool(user.get("profile_edit_allowed", False)),
+            "profile_completed": user["role"] == "admin" or str(user["_id"]) in completed,
             "created_at": user["created_at"].isoformat(),
         }
         for user in users
@@ -908,6 +942,8 @@ async def approve_access_request(
     user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if not await _profile_is_complete(db, user):
+        raise HTTPException(status_code=400, detail="Cannot approve until profile is completed")
     await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"active": True}})
     await log_event_async(db, user_id, "access_approved", "Access approved")
     return {"id": user_id, "status": "approved"}
