@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Optional, Literal
+import csv
+import io
 import secrets
 import string
 import os
@@ -123,6 +125,11 @@ class CreateUserRequest(BaseModel):
 
 class ResetSelectedExamsRequest(BaseModel):
     user_ids: list[str] = Field(default_factory=list, min_items=1)
+
+
+class BulkDeleteUsersRequest(BaseModel):
+    user_ids: list[str] = Field(default_factory=list)
+    delete_all_students: bool = False
 
 
 class CertificationApprovalRequest(BaseModel):
@@ -590,6 +597,118 @@ async def delete_user(
     await db.users.delete_one({"_id": ObjectId(user_id)})
     await log_event_async(db, None, "user_delete", f"Deleted user {user['email']}")
     return {"deleted": user_id}
+
+
+@router.post("/users/bulk-delete")
+async def bulk_delete_users(
+    payload: BulkDeleteUsersRequest,
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    if payload.delete_all_students:
+        target_query = {"role": "student"}
+    else:
+        if not payload.user_ids:
+            raise HTTPException(status_code=400, detail="No users selected")
+        try:
+            object_ids = [ObjectId(uid) for uid in payload.user_ids]
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid user id list")
+        target_query = {"_id": {"$in": object_ids}, "role": "student"}
+
+    users = await db.users.find(target_query).to_list(length=None)
+    student_ids = [str(user["_id"]) for user in users]
+    if not student_ids:
+        return {"deleted": 0, "students": 0}
+
+    email_by_id = {user_id: user["email"] for user in users}
+    await db.exam_results.delete_many({"user_id": {"$in": student_ids}})
+    await db.student_profiles.delete_many({"user_id": {"$in": student_ids}})
+    await db.audit_logs.delete_many({"user_id": {"$in": student_ids}})
+    await db.users.delete_many({"_id": {"$in": [ObjectId(uid) for uid in student_ids]}})
+
+    deleted_emails = ", ".join(email_by_id[uid] for uid in student_ids[:5])
+    await log_event_async(
+        db,
+        None,
+        "user_delete_bulk",
+        f"Deleted {len(student_ids)} student(s): {deleted_emails}{'...' if len(student_ids) > 5 else ''}",
+    )
+    return {"deleted": len(student_ids), "students": len(student_ids)}
+
+
+@router.post("/users/import")
+async def import_users_csv(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    content = await file.read()
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = content.decode("latin-1")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Unsupported file encoding")
+
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV file is empty or missing headers")
+
+    created = []
+    errors = []
+    for index, row in enumerate(rows, start=2):
+        email = (row.get("email") or row.get("Email") or "").strip().lower()
+        role_raw = (row.get("role") or row.get("Role") or "student").strip().lower()
+        password = (row.get("password") or row.get("Password") or "").strip()
+
+        if not email:
+            errors.append({"row": index, "email": "", "error": "Missing email"})
+            continue
+        role = role_raw if role_raw in {"student", "instructor", "admin"} else "student"
+        existing = await db.users.find_one({"email": email})
+        if existing:
+            errors.append({"row": index, "email": email, "error": "User already exists"})
+            continue
+
+        if password:
+            password_to_set = password
+            must_change_password = False
+            expires_at = None
+            generated_password = None
+        else:
+            generated_password = _generate_temp_password()
+            password_to_set = generated_password
+            must_change_password = True
+            expires_at = datetime.utcnow() + timedelta(minutes=TEMP_PASSWORD_TTL_MINUTES)
+
+        result = await db.users.insert_one({
+            "email": email,
+            "password_hash": hash_password(password_to_set),
+            "role": role,
+            "active": True,
+            "profile_edit_allowed": False,
+            "must_change_password": must_change_password,
+            "temp_password_expires_at": expires_at,
+            "created_at": datetime.utcnow(),
+        })
+        await log_event_async(db, str(result.inserted_id), "user_create", f"Created {role} {email}")
+        created.append({"email": email, "role": role, "temporary_password": generated_password})
+
+    await log_event_async(
+        db,
+        None,
+        "user_import",
+        f"CSV import: {len(created)} created, {len(errors)} failed",
+    )
+    return {"created": created, "errors": errors, "created_count": len(created), "error_count": len(errors)}
 
 
 @router.delete("/users/{user_id}/exams")
