@@ -745,6 +745,44 @@ async def import_users_csv(
     return {"created": created, "errors": errors, "created_count": len(created), "error_count": len(errors)}
 
 
+@router.post("/users/import-credentials")
+async def import_credentials(
+    current_user=Depends(get_current_user),
+    db = Depends(get_database),
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    candidates = await db.users.find(
+        {"must_change_password": True, "active": True}
+    ).to_list(length=None)
+    issued = []
+    for user in candidates:
+        temp_password = _generate_temp_password()
+        expires_at = datetime.utcnow() + timedelta(minutes=TEMP_PASSWORD_TTL_MINUTES)
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "password_hash": hash_password(temp_password),
+                    "must_change_password": True,
+                    "temp_password_expires_at": expires_at,
+                }
+            },
+        )
+        issued.append({
+            "email": user["email"],
+            "role": user["role"],
+            "temporary_password": temp_password,
+        })
+    await log_event_async(
+        db,
+        None,
+        "user_credentials",
+        f"Issued {len(issued)} temporary password(s) to accounts still on temp credentials",
+    )
+    return {"created": issued, "created_count": len(issued)}
+
+
 @router.delete("/users/{user_id}/exams")
 async def reset_user_exams(
     user_id: str,
